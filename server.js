@@ -1,6 +1,6 @@
 import http from 'http';
 import fs from 'fs';
-import path from 'path';
+import path, { posix } from 'path';
 import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -48,6 +48,124 @@ fs.watch(INDEX_PATH, { persistent: true }, eventType => {
   }
 });
 
+// 改寫 import 成 /@modules/...
+
+// 判斷是不是從包中引入的
+function isBareImport(spec) {
+  return (
+    !spec.startsWith('/') &&
+    !spec.startsWith('./') &&
+    !spec.startsWith('../') &&
+    !spec.startsWith('http://') &&
+    !spec.startsWith('https://')
+  );
+}
+
+function isRelativeImport(spec) {
+  return spec.startsWith('./') || spec.startsWith('../');
+}
+
+function rewriteSpecifier(spec, ctx = {}) {
+  if (ctx.isModuleRequest && isRelativeImport(spec)) {
+    const base = ctx.urlBase || '/';
+    const absUrl = posix.normalize(posix.join(base, spec));
+    return absUrl;
+  }
+
+  if (isBareImport(spec)) {
+    return `/@modules/${spec}`;
+  }
+
+  return spec;
+}
+
+function rewriteImports(code, ctx) {
+  const R = s => rewriteSpecifier(s, ctx);
+
+  code = code.replace(
+    /from\s+(['"])([^'"]+)\1/g,
+    (m, q, s) => `from ${q}${R(s)}${q}`
+  );
+  // import "x"
+  code = code.replace(
+    /import\s+(['"])([^'"]+)\1/g,
+    (m, q, s) => `import ${q}${R(s)}${q}`
+  );
+  // export ... from "x"
+  code = code.replace(/export\s+[^;]*\s+from\s+(['"])([^'"]+)\1/g, (m, q, s) =>
+    m.replace(s, R(s))
+  );
+  // dynamic import
+  code = code.replace(
+    /import\(\s*(['"])([^'"]+)\1\s*\)/g,
+    (m, q, s) => `import(${q}${R(s)}${q})`
+  );
+  return code;
+}
+
+// 解析 /@modules/<包>
+function parseModuleRequest(urlPath) {
+  const after = urlPath.slice('/@modules/'.length);
+  const segs = after.split('/').filter(s => Boolean(s));
+  if (segs.length === 0) throw new Error('Invalid /@modules request');
+
+  let moduleName, subPath;
+
+  if (segs[0].startsWith('@')) {
+    moduleName = segs.slice(0, 2).join('/');
+    subPath = segs.slice(2).join('/');
+  } else {
+    moduleName = segs[0];
+    subPath = segs.slice(1).join('/');
+  }
+
+  return { moduleName, subPath };
+}
+
+function ensureJsLike(p) {
+  if (path.extname(p)) return p;
+  if (fs.existsSync(p + '.js')) return p + '.js';
+  else if (fs.existsSync(p + '.mjs')) return p + '.mjs';
+  else if (fs.existsSync(p + '.ts')) return p + '.ts';
+}
+
+function resolveModuleEntry(moduleName, subPath) {
+  const pkgDir = path.join(__dirname, 'node_modules', moduleName);
+  const pkgJsonPath = path.join(pkgDir, 'package.json');
+  if (!fs.existsSync(pkgJsonPath)) {
+    throw new Error(`Cannot find package.json for ${moduleName}`);
+  }
+  const pkg = JSON.parse(fs.readFileSync(pkgJsonPath, 'utf-8'));
+
+  // 如果有子路徑，加上副檔名直接指向檔案
+  if (subPath) {
+    return ensureJsLike(path.join(pkgDir, subPath));
+  }
+
+  // 無子路徑，挑 ESM 友善的欄位
+  let candidate = null;
+  if (typeof pkg.exports === 'string') candidate = pkg.exports;
+  else if (
+    pkg.exports &&
+    typeof pkg.exports === 'object' &&
+    typeof pkg.exports['.'] === 'string'
+  )
+    candidate = pkg.exports['.'];
+  else if (pkg.module) candidate = pkg.module;
+  else if (typeof pkg.browser === 'string') candidate = pkg.browser;
+  else if (typeof pkg.main === 'string') candidate = pkg.main;
+  else candidate = 'index.js';
+
+  return path.join(pkgDir, candidate);
+}
+
+// 防止跳脫到專案外
+function safeJoin(root, urlPath) {
+  const normalized = path.normalize(urlPath).replace(/^(\.\.(\/|\\|$))+/g, '');
+  return path.join(root, normalized);
+}
+
+// server 主程式
 const server = http.createServer((req, res) => {
   const url = decodeURIComponent(req.url || '/');
 
@@ -74,7 +192,37 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  const filePath = path.join(
+  if (url.startsWith('/@modules/')) {
+    try {
+      const { moduleName, subPath } = parseModuleRequest(url);
+      const absPath = resolveModuleEntry(moduleName, subPath);
+
+      let baseFromSub = '';
+      if (subPath) {
+        const dir = posix.dirname('/' + subPath);
+        baseFromSub = dir === '/' ? '' : dir;
+      }
+      const urlBase = `/@modules/${moduleName}${baseFromSub}`;
+
+      const code = fs.readFileSync(absPath, 'utf-8');
+      const transformed = rewriteImports(code, {
+        isModuleRequest: true,
+        urlBase
+      });
+
+      res.writeHead(200, {
+        'content-type': 'application/javascript; charset=utf-8',
+        'cache-control': 'no-store'
+      });
+      res.end(transformed);
+    } catch (err) {
+      res.writeHead(500, { 'content-type': 'text/plain; charset=utf-8' });
+      res.end(`[mini-vite] Failed to resolve module: ${err.message}`);
+    }
+    return;
+  }
+
+  const filePath = safeJoin(
     __dirname,
     req.url === '/' ? '/index.html' : req.url
   );
@@ -91,11 +239,19 @@ const server = http.createServer((req, res) => {
       return;
     }
 
+    const ct = getContentType(filePath);
+
     res.writeHead(200, {
-      'Content-Type': getContentType(filePath),
+      'Content-Type': ct,
       'cache-control': 'no-store'
     });
-    res.end(data);
+
+    if (ct === 'application/javascript; charset=utf-8') {
+      const transformed = rewriteImports(data.toString('utf-8'));
+      res.end(transformed);
+    } else {
+      res.end(data);
+    }
   });
 });
 
