@@ -65,6 +65,7 @@ function isRelativeImport(spec) {
   return spec.startsWith('./') || spec.startsWith('../');
 }
 
+// ctx: { isModuleRequest?: boolean, urlBase?: string }
 function rewriteSpecifier(spec, ctx = {}) {
   if (ctx.isModuleRequest && isRelativeImport(spec)) {
     const base = ctx.urlBase || '/';
@@ -101,6 +102,27 @@ function rewriteImports(code, ctx) {
     (m, q, s) => `import(${q}${R(s)}${q})`
   );
   return code;
+}
+
+// JSON 包裝
+function wrapJsonAsJs(jsonText) {
+  return `export default ${jsonText};\n`;
+}
+
+// CSS 包裝
+function wrapCssAsJs(cssText) {
+  // 用 JSON.stringify() 安全的轉成字串
+  const cssStr = JSON.stringify(cssText);
+  return (
+    `
+    const css = ${cssStr};
+    const style = document.createElement('style');
+    style.setAttribute('type', 'text/css');
+    style.innerHTML = css;
+    document.head.appendChild(style);
+    export default css;
+  `.trim() + '\n'
+  );
 }
 
 // 解析 /@modules/<包>
@@ -236,6 +258,26 @@ const server = http.createServer((req, res) => {
         'content-type': 'text/plain; charset=utf-8'
       });
       res.end(message);
+      return;
+    }
+
+    const lower = filePath.toLowerCase();
+
+    if (lower.endsWith('.json')) {
+      res.writeHead(200, {
+        'content-type': 'application/javascript; charset=utf-8',
+        'cache-control': 'no-store'
+      });
+      res.end(wrapJsonAsJs(data.toString('utf-8')));
+      return;
+    }
+
+    if (lower.endsWith('.css')) {
+      res.writeHead(200, {
+        'content-type': 'application/javascript; charset=utf-8',
+        'cache-control': 'no-store'
+      });
+      res.end(wrapCssAsJs(data.toString('utf-8')));
       return;
     }
 
