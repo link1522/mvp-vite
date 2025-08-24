@@ -39,6 +39,52 @@ function boroadcastReload() {
   }
 }
 
+function debounce(fn, ms) {
+  let t = null;
+  return (...args) => {
+    clearTimeout(t);
+    t = setTimeout(() => fn(...args), ms);
+  };
+}
+
+const debouncedReload = debounce(() => {
+  console.log('[mini-vite] change detected → reload');
+  boroadcastReload();
+}, 60);
+
+const watchedDirs = new Set();
+function watchDirRecursive(dir) {
+  if (!fs.existsSync(dir)) return;
+  const real = fs.realpathSync(dir);
+  if (watchedDirs.has(real)) return;
+  watchedDirs.add(real);
+
+  try {
+    fs.watch(real, { persistent: true }, (eventType, filename) => {
+      if (filename) {
+        const full = path.join(real, filename);
+        fs.promises
+          .stat(full)
+          .then(st => {
+            if (st.isDirectory()) watchDirRecursive(full);
+          })
+          .catch(() => {});
+        debouncedReload();
+      } else {
+        debouncedReload();
+      }
+    });
+
+    for (const entry of fs.readdirSync(real)) {
+      const sub = path.join(real, entry);
+      try {
+        const st = fs.statSync(sub);
+        if (st.isDirectory()) watchDirRecursive();
+      } catch {}
+    }
+  } catch (e) {}
+}
+
 // 監聽 index.html
 const INDEX_PATH = path.join(__dirname, 'index.html');
 fs.watch(INDEX_PATH, { persistent: true }, eventType => {
@@ -47,6 +93,12 @@ fs.watch(INDEX_PATH, { persistent: true }, eventType => {
     boroadcastReload();
   }
 });
+
+// 監聽 src/**
+const SRC_DIR = path.join(__dirname, 'src');
+watchDirRecursive(SRC_DIR);
+
+fs.watch(__dirname);
 
 // 改寫 import 成 /@modules/...
 
