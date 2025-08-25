@@ -2,6 +2,8 @@ import http from 'http';
 import fs from 'fs';
 import path, { posix } from 'path';
 import { fileURLToPath } from 'url';
+import crypto from 'crypto';
+
 import { rewriteImports, wrapCssAsJs, wrapJsonAsJs } from './core/rewriter.js';
 import {
   parseModuleRequest,
@@ -46,6 +48,50 @@ function boroadcastReload() {
   }
 }
 
+// ========== HMR (WebSocket) ==========
+
+const wsClients = new Set();
+
+function createWsAccept(key) {
+  const GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
+  const sha1 = crypto.createHash('sha1');
+  sha1.update(key + GUID);
+  return sha1.digest('base64');
+}
+
+function encodeWsTextFrame(str) {
+  const payload = Buffer.from(str);
+  const len = payload.length;
+  let header;
+  if (len < 126) {
+    header = Buffer.alloc(2);
+    header[0] = 0x81;
+    header[1] = len;
+  } else if (len < 65536) {
+    header = Buffer.alloc(4);
+    header[0] = 0x81;
+    header[1] = 126;
+    header.writeUInt16BE(len, 2);
+  } else {
+    header = Buffer.alloc(10);
+    header[0] = 0x81;
+    header[1] = 127;
+    header.writeUInt32BE(0, 2);
+    header.writeUInt32BE(len, 6);
+  }
+  return Buffer.concat([header, payload]);
+}
+
+function wsBroadcast(obj) {
+  const msg = JSON.stringify(obj);
+  const frame = encodeWsTextFrame(msg);
+  for (const sock of wsClients) {
+    try {
+      sock.write(frame);
+    } catch {}
+  }
+}
+
 function debounce(fn, ms) {
   let t = null;
   return (...args) => {
@@ -57,6 +103,7 @@ function debounce(fn, ms) {
 const debouncedReload = debounce(() => {
   console.log('[mini-vite] change detected → reload');
   boroadcastReload();
+  wsBroadcast({ type: 'full-reload' });
 }, 60);
 
 const watchedDirs = new Set();
@@ -215,6 +262,37 @@ const server = http.createServer((req, res) => {
       res.end(data);
     }
   });
+});
+
+// WebSocket 升級握手: /__hmr
+server.on('upgrade', (req, socket) => {
+  if (!req.url || !req.url.startsWith('/__hmr')) {
+    socket.destroy();
+    return;
+  }
+  const key = req.headers['sec-websocket-key'];
+  const version = req.headers['sec-websocket-version'];
+  if (!key || version !== '13') {
+    socket.destroy();
+    return;
+  }
+
+  const accept = createWsAccept(String(key));
+  const headers = [
+    'HTTP/1.1 101 Switching Protocals',
+    'Upgrade: websocket',
+    'Connection: Upgrade',
+    `Sec-WebSocket-Accept: ${accept}`
+  ];
+  socket.write(headers.join('\r\n') + '\r\n\r\n');
+
+  wsClients.add(socket);
+  socket.on('close', () => wsClients.delete(socket));
+  socket.on('end', () => wsClients.delete(socket));
+  socket.on('error', () => wsClients.delete(socket));
+
+  // 目前不處理 client->server 訊息；忽略資料（可在 Day 11 擴充）
+  socket.on('data', () => {});
 });
 
 server.listen(PORT, () => {
