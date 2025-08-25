@@ -106,6 +106,42 @@ const debouncedReload = debounce(() => {
   wsBroadcast({ type: 'full-reload' });
 }, 60);
 
+const updatesQueue = new Map(); // Map<path, {type, path, timestamp}>
+const flushUpdates = debounce(() => {
+  const updates = Array.from(updatesQueue.values());
+  updatesQueue.clear();
+  wsBroadcast({ type: 'update', updates });
+}, 60);
+
+function enqueueCssUpdate(cssPath) {
+  updatesQueue.set(cssPath, {
+    type: 'css',
+    path: cssPath,
+    timestamp: Date.now()
+  });
+  flushUpdates();
+}
+
+function toUrlPath(absPath) {
+  const rel = path.relative(__dirname, absPath);
+  if (!rel || rel.startsWith('..')) return null;
+  return '/' + rel.split(path.sep).join(posix.sep);
+}
+
+function notifyFileChanged(absFullPath) {
+  const urlPath = toUrlPath(absFullPath);
+  if (!urlPath) return debouncedReload();
+
+  const ext = path.extname(urlPath).toLowerCase();
+  if (ext === '.css') {
+    console.log('[mini-vite] css update →', urlPath);
+    enqueueCssUpdate(urlPath);
+    return;
+  }
+
+  debouncedReload();
+}
+
 const watchedDirs = new Set();
 function watchDirRecursive(dir) {
   if (!fs.existsSync(dir)) return;
@@ -123,7 +159,7 @@ function watchDirRecursive(dir) {
             if (st.isDirectory()) watchDirRecursive(full);
           })
           .catch(() => {});
-        debouncedReload();
+        notifyFileChanged(full);
       } else {
         debouncedReload();
       }
@@ -133,7 +169,7 @@ function watchDirRecursive(dir) {
       const sub = path.join(real, entry);
       try {
         const st = fs.statSync(sub);
-        if (st.isDirectory()) watchDirRecursive();
+        if (st.isDirectory()) watchDirRecursive(sub);
       } catch {}
     }
   } catch (e) {}
@@ -145,6 +181,7 @@ fs.watch(INDEX_PATH, { persistent: true }, (eventType) => {
   if (eventType === 'change') {
     console.log('[mini-vite] index.html changed → reload');
     boroadcastReload();
+    wsBroadcast({ type: 'full-reload', path: '/index.html' });
   }
 });
 
@@ -156,10 +193,12 @@ fs.watch(__dirname);
 
 // server 主程式
 const server = http.createServer((req, res) => {
-  const url = decodeURIComponent(req.url || '/');
+  const rawUrl = decodeURIComponent(req.url || '/');
+  const u = new URL(rawUrl, 'http://localhost');
+  const urlPath = u.pathname;
 
   // sse 端點
-  if (url === '/__livereload') {
+  if (urlPath === '/__livereload') {
     res.writeHead(200, {
       'content-type': 'text/event-stream',
       'cache-control': 'no-cache, no-transform',
@@ -172,7 +211,7 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  if (url === '/livereload.js') {
+  if (urlPath === '/livereload.js') {
     res.writeHead(200, {
       'content-type': 'application/javascript; charset=utf-8',
       'cache-control': 'no-store'
@@ -181,9 +220,9 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  if (url.startsWith('/@modules/')) {
+  if (urlPath.startsWith('/@modules/')) {
     try {
-      const { moduleName, subPath } = parseModuleRequest(url);
+      const { moduleName, subPath } = parseModuleRequest(urlPath);
       const absPath = resolveModuleEntry(moduleName, subPath);
 
       let baseFromSub = '';
@@ -213,7 +252,7 @@ const server = http.createServer((req, res) => {
 
   const filePath = safeJoin(
     __dirname,
-    req.url === '/' ? '/index.html' : req.url
+    urlPath === '/' ? '/index.html' : urlPath
   );
 
   fs.readFile(filePath, (err, data) => {
@@ -240,11 +279,20 @@ const server = http.createServer((req, res) => {
     }
 
     if (lower.endsWith('.css')) {
+      const isRaw = u.searchParams.has('raw');
+      if (isRaw) {
+        res.writeHead(200, {
+          'content-type': 'text/css; charset=utf-8',
+          'cache-control': 'no-store'
+        });
+        res.end(data.toString('utf-8'));
+        return;
+      }
       res.writeHead(200, {
         'content-type': 'application/javascript; charset=utf-8',
         'cache-control': 'no-store'
       });
-      res.end(wrapCssAsJs(data.toString('utf-8')));
+      res.end(wrapCssAsJs(data.toString('utf-8'), urlPath));
       return;
     }
 
@@ -279,7 +327,7 @@ server.on('upgrade', (req, socket) => {
 
   const accept = createWsAccept(String(key));
   const headers = [
-    'HTTP/1.1 101 Switching Protocals',
+    'HTTP/1.1 101 Switching Protocols',
     'Upgrade: websocket',
     'Connection: Upgrade',
     `Sec-WebSocket-Accept: ${accept}`

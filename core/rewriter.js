@@ -61,16 +61,21 @@ export function wrapJsonAsJs(jsonText) {
 }
 
 // CSS 包裝
-export function wrapCssAsJs(cssText) {
-  // 用 JSON.stringify() 安全的轉成字串
+export function wrapCssAsJs(cssText, id = '') {
   const cssStr = JSON.stringify(cssText);
+  const idStr = JSON.stringify(id);
   return (
     `
     const css = ${cssStr};
-    const style = document.createElement('style');
-    style.setAttribute('type', 'text/css');
+    const id = ${idStr};
+    let style = document.querySelector('style[data-mv-href=' + JSON.stringify(id) + ']');
+    if (!style) {
+      style = document.createElement('style');
+      style.setAttribute('type', 'text/css');
+      if (id) style.setAttribute('data-mv-href', id);
+      document.head.appendChild(style);
+    }
     style.innerHTML = css;
-    document.head.appendChild(style);
     export default css;
   `.trim() + '\n'
   );
