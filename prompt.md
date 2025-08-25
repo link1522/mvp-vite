@@ -1,36 +1,64 @@
 你現在要扮演我的教練，帶我完成「30 天打造迷你 Vite」計畫。
-我們已完成 Day 1–7，接下來請從我指定的 Day（預設 Day 7）繼續，一天一小步：先給最小可行的改動完整檔案、再給測試步驟與驗收標準，最後給 1 段簡短原理說明。全程以 JavaScript（非 TypeScript）實作，不引入不必要的套件。
+請嚴格遵守輸出格式：先給完整檔案 → 再給測試步驟 → 再給驗收標準 → 最後 3–5 句原理說明。
+全程以 JavaScript（非 TypeScript） 實作；不引入不必要套件；不使用 302。
+我會用「開始 Day X」來指定天數；若我沒指定，預設從 Day 10 開始。
 
-我目前的專案狀態
+專案狀態（請記住）
 
-目標：做一個「迷你 Vite」開發伺服器（Dev-only 為主，之後再加 Build 與 Plugin）。
+專案根：mini-vite/
 
-專案結構（簡化）：
+package.json（已設為 ESM）：
+
+```JSON
+{
+  "type": "module",
+  "scripts": {
+    "dev": "nodemon server.js"
+  }
+}
+
+目前目錄（簡化）：
+
+```
 
 mini-vite/
-├─ package.json // { "type": "module" }, scripts: { "dev": "nodemon server.js" }
-├─ server.js // 最新版（見下方能力清單）
-├─ index.html // 已載入 /livereload.js 與 /src/main.js
+├─ package.json
+├─ server.js
+├─ hmr.js
+├─ core/
+│ ├─ rewriter.js
+│ ├─ resolver.js
+│ └─ static.js
+├─ index.html
 └─ src/
 ├─ main.js
-├─ style.css // Day 5 測試用
-└─ data.json // Day 5 測試用
+├─ style.css
+└─ data.json
 
-目前的 server.js:
+```
 
-```javascript
+現有檔案內容（以此為準）
+mini-vite/server.js
 import http from 'http';
 import fs from 'fs';
 import path, { posix } from 'path';
 import { fileURLToPath } from 'url';
+import crypto from 'crypto';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+import { rewriteImports, wrapCssAsJs, wrapJsonAsJs } from './core/rewriter.js';
+import {
+parseModuleRequest,
+resolveModuleEntry,
+safeJoin
+} from './core/resolver.js';
+import { getContentType } from './core/static.js';
+
+const **filename = fileURLToPath(import.meta.url);
+const **dirname = path.dirname(\_\_filename);
 
 const PORT = 3000;
 
-const livereloadClientJs = `
-// live reload
+const livereloadClientJs = `// live reload (SSE)
 const src = location.origin + '/__livereload';
 const es = new EventSource(src);
 es.addEventListener('message', e => {
@@ -44,253 +72,191 @@ es.addEventListener('open', () =>
 );
 es.addEventListener('error', () =>
   console.log('[mini-vite] Live reload disconnected')
-);
-`;
+);`;
 
-// 儲存所有連線中 SSE 回應 (多分頁也能一起刷新)
+// ===== SSE =====
 const sseClients = new Set();
-
-// 廣播 reload
 function boroadcastReload() {
-  const payload = 'data: reload\n\n';
-  for (const res of sseClients) {
-    try {
-      res.write(payload);
-    } catch (_) {}
-  }
+const payload = 'data: reload\n\n';
+for (const res of sseClients) {
+try { res.write(payload); } catch (\_) {}
+}
 }
 
+// ===== HMR (WebSocket) =====
+const wsClients = new Set();
+
+function createWsAccept(key) {
+const GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
+const sha1 = crypto.createHash('sha1');
+sha1.update(key + GUID);
+return sha1.digest('base64');
+}
+
+function encodeWsTextFrame(str) {
+const payload = Buffer.from(str);
+const len = payload.length;
+let header;
+if (len < 126) {
+header = Buffer.alloc(2);
+header[0] = 0x81; // FIN + text
+header[1] = len; // server->client 無 mask
+} else if (len < 65536) {
+header = Buffer.alloc(4);
+header[0] = 0x81;
+header[1] = 126;
+header.writeUInt16BE(len, 2);
+} else {
+header = Buffer.alloc(10);
+header[0] = 0x81;
+header[1] = 127;
+header.writeUInt32BE(0, 2);
+header.writeUInt32BE(len, 6);
+}
+return Buffer.concat([header, payload]);
+}
+
+function wsBroadcast(obj) {
+const msg = JSON.stringify(obj);
+const frame = encodeWsTextFrame(msg);
+for (const sock of wsClients) {
+try { sock.write(frame); } catch {}
+}
+}
+
+// ===== debounce 工具 =====
 function debounce(fn, ms) {
-  let t = null;
-  return (...args) => {
-    clearTimeout(t);
-    t = setTimeout(() => fn(...args), ms);
-  };
+let t = null;
+return (...args) => {
+clearTimeout(t);
+t = setTimeout(() => fn(...args), ms);
+};
 }
 
+// 全頁重載（合併多次）
 const debouncedReload = debounce(() => {
-  console.log('[mini-vite] change detected → reload');
-  boroadcastReload();
+console.log('[mini-vite] change detected → reload');
+boroadcastReload();
+wsBroadcast({ type: 'full-reload' });
 }, 60);
+
+// CSS 更新聚合（同一視窗去重）
+const updatesQueue = new Map(); // Map<path, { type, path, timestamp }>
+const flushUpdates = debounce(() => {
+const updates = Array.from(updatesQueue.values());
+updatesQueue.clear();
+if (updates.length) {
+wsBroadcast({ type: 'update', updates });
+}
+}, 60);
+function enqueueCssUpdate(cssPath) {
+updatesQueue.set(cssPath, { type: 'css', path: cssPath, timestamp: Date.now() });
+flushUpdates();
+}
+
+// ===== 監看與通知 =====
+function toUrlPath(absPath) {
+const rel = path.relative(\_\_dirname, absPath);
+if (!rel || rel.startsWith('..')) return null;
+return '/' + rel.split(path.sep).join(posix.sep);
+}
+
+function notifyFileChanged(absFullPath) {
+const urlPath = toUrlPath(absFullPath);
+if (!urlPath) return debouncedReload();
+
+const ext = path.extname(urlPath).toLowerCase();
+if (ext === '.css') {
+console.log('[mini-vite] css update →', urlPath);
+enqueueCssUpdate(urlPath);
+return;
+}
+
+debouncedReload();
+}
 
 const watchedDirs = new Set();
 function watchDirRecursive(dir) {
-  if (!fs.existsSync(dir)) return;
-  const real = fs.realpathSync(dir);
-  if (watchedDirs.has(real)) return;
-  watchedDirs.add(real);
+if (!fs.existsSync(dir)) return;
+const real = fs.realpathSync(dir);
+if (watchedDirs.has(real)) return;
+watchedDirs.add(real);
 
-  try {
-    fs.watch(real, { persistent: true }, (eventType, filename) => {
-      if (filename) {
-        const full = path.join(real, filename);
-        fs.promises
-          .stat(full)
-          .then(st => {
-            if (st.isDirectory()) watchDirRecursive(full);
-          })
-          .catch(() => {});
-        debouncedReload();
-      } else {
-        debouncedReload();
-      }
-    });
+try {
+fs.watch(real, { persistent: true }, (eventType, filename) => {
+if (filename) {
+const full = path.join(real, filename);
+fs.promises.stat(full).then((st) => {
+if (st.isDirectory()) watchDirRecursive(full);
+}).catch(() => {});
+notifyFileChanged(full);
+} else {
+debouncedReload();
+}
+});
 
     for (const entry of fs.readdirSync(real)) {
       const sub = path.join(real, entry);
       try {
         const st = fs.statSync(sub);
-        if (st.isDirectory()) watchDirRecursive();
+        if (st.isDirectory()) watchDirRecursive(sub);
       } catch {}
     }
-  } catch (e) {}
+
+} catch (e) {}
 }
 
-// 監聽 index.html
-const INDEX_PATH = path.join(__dirname, 'index.html');
-fs.watch(INDEX_PATH, { persistent: true }, eventType => {
-  if (eventType === 'change') {
-    console.log('[mini-vite] index.html changed → reload');
-    boroadcastReload();
-  }
+// 單檔監看（index.html 仍整頁刷新）
+const INDEX_PATH = path.join(\_\_dirname, 'index.html');
+fs.watch(INDEX_PATH, { persistent: true }, (eventType) => {
+if (eventType === 'change') {
+console.log('[mini-vite] index.html changed → reload');
+boroadcastReload();
+wsBroadcast({ type: 'full-reload', path: '/index.html' });
+}
 });
 
-// 監聽 src/**
-const SRC_DIR = path.join(__dirname, 'src');
+// 監看 src/\*\*
+const SRC_DIR = path.join(\_\_dirname, 'src');
 watchDirRecursive(SRC_DIR);
 
-fs.watch(__dirname);
+fs.watch(\_\_dirname);
 
-// 改寫 import 成 /@modules/...
-
-// 判斷是不是從包中引入的
-function isBareImport(spec) {
-  return (
-    !spec.startsWith('/') &&
-    !spec.startsWith('./') &&
-    !spec.startsWith('../') &&
-    !spec.startsWith('http://') &&
-    !spec.startsWith('https://')
-  );
-}
-
-function isRelativeImport(spec) {
-  return spec.startsWith('./') || spec.startsWith('../');
-}
-
-// ctx: { isModuleRequest?: boolean, urlBase?: string }
-function rewriteSpecifier(spec, ctx = {}) {
-  if (ctx.isModuleRequest && isRelativeImport(spec)) {
-    const base = ctx.urlBase || '/';
-    const absUrl = posix.normalize(posix.join(base, spec));
-    return absUrl;
-  }
-
-  if (isBareImport(spec)) {
-    return `/@modules/${spec}`;
-  }
-
-  return spec;
-}
-
-function rewriteImports(code, ctx) {
-  const R = s => rewriteSpecifier(s, ctx);
-
-  code = code.replace(
-    /from\s+(['"])([^'"]+)\1/g,
-    (m, q, s) => `from ${q}${R(s)}${q}`
-  );
-  // import "x"
-  code = code.replace(
-    /import\s+(['"])([^'"]+)\1/g,
-    (m, q, s) => `import ${q}${R(s)}${q}`
-  );
-  // export ... from "x"
-  code = code.replace(/export\s+[^;]*\s+from\s+(['"])([^'"]+)\1/g, (m, q, s) =>
-    m.replace(s, R(s))
-  );
-  // dynamic import
-  code = code.replace(
-    /import\(\s*(['"])([^'"]+)\1\s*\)/g,
-    (m, q, s) => `import(${q}${R(s)}${q})`
-  );
-  return code;
-}
-
-// JSON 包裝
-function wrapJsonAsJs(jsonText) {
-  return `export default ${jsonText};\n`;
-}
-
-// CSS 包裝
-function wrapCssAsJs(cssText) {
-  // 用 JSON.stringify() 安全的轉成字串
-  const cssStr = JSON.stringify(cssText);
-  return (
-    `
-    const css = ${cssStr};
-    const style = document.createElement('style');
-    style.setAttribute('type', 'text/css');
-    style.innerHTML = css;
-    document.head.appendChild(style);
-    export default css;
-  `.trim() + '\n'
-  );
-}
-
-// 解析 /@modules/<包>
-function parseModuleRequest(urlPath) {
-  const after = urlPath.slice('/@modules/'.length);
-  const segs = after.split('/').filter(s => Boolean(s));
-  if (segs.length === 0) throw new Error('Invalid /@modules request');
-
-  let moduleName, subPath;
-
-  if (segs[0].startsWith('@')) {
-    moduleName = segs.slice(0, 2).join('/');
-    subPath = segs.slice(2).join('/');
-  } else {
-    moduleName = segs[0];
-    subPath = segs.slice(1).join('/');
-  }
-
-  return { moduleName, subPath };
-}
-
-function ensureJsLike(p) {
-  if (path.extname(p)) return p;
-  if (fs.existsSync(p + '.js')) return p + '.js';
-  else if (fs.existsSync(p + '.mjs')) return p + '.mjs';
-  else if (fs.existsSync(p + '.ts')) return p + '.ts';
-}
-
-function resolveModuleEntry(moduleName, subPath) {
-  const pkgDir = path.join(__dirname, 'node_modules', moduleName);
-  const pkgJsonPath = path.join(pkgDir, 'package.json');
-  if (!fs.existsSync(pkgJsonPath)) {
-    throw new Error(`Cannot find package.json for ${moduleName}`);
-  }
-  const pkg = JSON.parse(fs.readFileSync(pkgJsonPath, 'utf-8'));
-
-  // 如果有子路徑，加上副檔名直接指向檔案
-  if (subPath) {
-    return ensureJsLike(path.join(pkgDir, subPath));
-  }
-
-  // 無子路徑，挑 ESM 友善的欄位
-  let candidate = null;
-  if (typeof pkg.exports === 'string') candidate = pkg.exports;
-  else if (
-    pkg.exports &&
-    typeof pkg.exports === 'object' &&
-    typeof pkg.exports['.'] === 'string'
-  )
-    candidate = pkg.exports['.'];
-  else if (pkg.module) candidate = pkg.module;
-  else if (typeof pkg.browser === 'string') candidate = pkg.browser;
-  else if (typeof pkg.main === 'string') candidate = pkg.main;
-  else candidate = 'index.js';
-
-  return path.join(pkgDir, candidate);
-}
-
-// 防止跳脫到專案外
-function safeJoin(root, urlPath) {
-  const normalized = path.normalize(urlPath).replace(/^(\.\.(\/|\\|$))+/g, '');
-  return path.join(root, normalized);
-}
-
-// server 主程式
+// ===== HTTP Server =====
 const server = http.createServer((req, res) => {
-  const url = decodeURIComponent(req.url || '/');
+const rawUrl = decodeURIComponent(req.url || '/');
+const u = new URL(rawUrl, 'http://localhost'); // 解析出 pathname + search
+const urlPath = u.pathname;
 
-  // sse 端點
-  if (url === '/__livereload') {
-    res.writeHead(200, {
-      'content-type': 'text/event-stream',
-      'cache-control': 'no-cache, no-transform',
-      connection: 'keep-alive',
-      'access-control-allow-origin': '*'
-    });
-    res.write('retry: 1000\n\n'); // 斷線後 1s 嘗試重連
-    sseClients.add(res);
-    req.on('close', () => sseClients.delete(res));
-    return;
-  }
+// SSE 端點
+if (urlPath === '/\_\_livereload') {
+res.writeHead(200, {
+'content-type': 'text/event-stream',
+'cache-control': 'no-cache, no-transform',
+connection: 'keep-alive',
+'access-control-allow-origin': '\*'
+});
+res.write('retry: 1000\n\n');
+sseClients.add(res);
+req.on('close', () => sseClients.delete(res));
+return;
+}
 
-  if (url === '/livereload.js') {
-    res.writeHead(200, {
-      'content-type': 'application/javascript; charset=utf-8',
-      'cache-control': 'no-store'
-    });
-    res.end(livereloadClientJs);
-    return;
-  }
+// /livereload.js
+if (urlPath === '/livereload.js') {
+res.writeHead(200, {
+'content-type': 'application/javascript; charset=utf-8',
+'cache-control': 'no-store'
+});
+res.end(livereloadClientJs);
+return;
+}
 
-  if (url.startsWith('/@modules/')) {
-    try {
-      const { moduleName, subPath } = parseModuleRequest(url);
-      const absPath = resolveModuleEntry(moduleName, subPath);
+// 裸模組：/@modules/\*\*
+if (urlPath.startsWith('/@modules/')) {
+try {
+const { moduleName, subPath } = parseModuleRequest(urlPath);
+const absPath = resolveModuleEntry(moduleName, subPath);
 
       let baseFromSub = '';
       if (subPath) {
@@ -315,24 +281,21 @@ const server = http.createServer((req, res) => {
       res.end(`[mini-vite] Failed to resolve module: ${err.message}`);
     }
     return;
-  }
 
-  const filePath = safeJoin(
-    __dirname,
-    req.url === '/' ? '/index.html' : req.url
-  );
+}
 
-  fs.readFile(filePath, (err, data) => {
-    if (err) {
-      const isNotFound = err.code === 'ENOENT';
-      const status = isNotFound ? 404 : 500;
-      const message = isNotFound ? 'Not Found' : `Server error: ${err.message}`;
-      res.writeHead(status, {
-        'content-type': 'text/plain; charset=utf-8'
-      });
-      res.end(message);
-      return;
-    }
+// 一般靜態（支援 ?raw 供 CSS HMR 抓純樣式）
+const filePath = safeJoin(\_\_dirname, urlPath === '/' ? '/index.html' : urlPath);
+
+fs.readFile(filePath, (err, data) => {
+if (err) {
+const isNotFound = err.code === 'ENOENT';
+const status = isNotFound ? 404 : 500;
+const message = isNotFound ? 'Not Found' : `Server error: ${err.message}`;
+res.writeHead(status, { 'content-type': 'text/plain; charset=utf-8' });
+res.end(message);
+return;
+}
 
     const lower = filePath.toLowerCase();
 
@@ -346,20 +309,25 @@ const server = http.createServer((req, res) => {
     }
 
     if (lower.endsWith('.css')) {
+      const isRaw = u.searchParams.has('raw'); // for HMR
+      if (isRaw) {
+        res.writeHead(200, {
+          'content-type': 'text/css; charset=utf-8',
+          'cache-control': 'no-store'
+        });
+        res.end(data.toString('utf-8'));
+        return;
+      }
       res.writeHead(200, {
         'content-type': 'application/javascript; charset=utf-8',
         'cache-control': 'no-store'
       });
-      res.end(wrapCssAsJs(data.toString('utf-8')));
+      res.end(wrapCssAsJs(data.toString('utf-8'), urlPath));
       return;
     }
 
     const ct = getContentType(filePath);
-
-    res.writeHead(200, {
-      'Content-Type': ct,
-      'cache-control': 'no-store'
-    });
+    res.writeHead(200, { 'Content-Type': ct, 'cache-control': 'no-store' });
 
     if (ct === 'application/javascript; charset=utf-8') {
       const transformed = rewriteImports(data.toString('utf-8'));
@@ -367,117 +335,329 @@ const server = http.createServer((req, res) => {
     } else {
       res.end(data);
     }
-  });
+
+});
 });
 
-function getContentType(filePath) {
-  if (filePath.endsWith('.html')) return 'text/html; charset=utf-8';
-  if (filePath.endsWith('.js')) return 'application/javascript; charset=utf-8';
-  if (filePath.endsWith('.css')) return 'text/css; charset=utf-8';
-  if (filePath.endsWith('.json')) return 'application/json; charset=utf-8';
-  if (filePath.endsWith('.svg')) return 'image/svg+xml';
-  return 'text/plain; charset=utf-8';
+// WebSocket 升級：/**hmr
+server.on('upgrade', (req, socket) => {
+if (!req.url || !req.url.startsWith('/**hmr')) {
+socket.destroy();
+return;
+}
+const key = req.headers['sec-websocket-key'];
+const version = req.headers['sec-websocket-version'];
+if (!key || version !== '13') {
+socket.destroy();
+return;
 }
 
-server.listen(PORT, () => {
-  console.log(
-    `Mini Vite dev server with Live Reload at http://localhost:${PORT}`
-  );
+const accept = createWsAccept(String(key));
+const headers = [
+'HTTP/1.1 101 Switching Protocols',
+'Upgrade: websocket',
+'Connection: Upgrade',
+`Sec-WebSocket-Accept: ${accept}`
+];
+socket.write(headers.join('\r\n') + '\r\n\r\n');
+
+wsClients.add(socket);
+socket.on('close', () => wsClients.delete(socket));
+socket.on('end', () => wsClients.delete(socket));
+socket.on('error', () => wsClients.delete(socket));
+socket.on('data', () => {}); // 暫不處理 client->server
 });
+
+server.listen(PORT, () => {
+console.log(`Mini Vite dev server with Live Reload & HMR at http://localhost:${PORT}`);
+});
+
+mini-vite/hmr.js
+// 最小 HMR 客戶端（WS）：支援 full-reload 與 CSS update
+(function () {
+const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+const url = proto + '//' + location.host + '/\_\_hmr';
+const ws = new WebSocket(url);
+
+ws.addEventListener('open', () => console.log('[mini-vite] HMR connected'));
+ws.addEventListener('close', () => console.log('[mini-vite] HMR disconnected'));
+
+async function updateCss(path) {
+try {
+const sep = path.includes('?') ? '&' : '?';
+const res = await fetch(path + sep + 'raw=1&t=' + Date.now(), { cache: 'no-store' });
+const css = await res.text();
+const styles = document.querySelectorAll('style[data-mv-href="' + path + '"]');
+if (styles.length) {
+styles.forEach((el) => (el.textContent = css));
+} else {
+const el = document.createElement('style');
+el.setAttribute('type', 'text/css');
+el.setAttribute('data-mv-href', path);
+el.textContent = css;
+document.head.appendChild(el);
+}
+console.log('[mini-vite] HMR(css): updated', path);
+} catch (e) {
+console.warn('[mini-vite] HMR(css) failed, fallback to reload', e);
+location.reload();
+}
+}
+
+ws.addEventListener('message', (e) => {
+try {
+const msg = JSON.parse(e.data);
+if (msg && msg.type === 'full-reload') {
+console.log('[mini-vite] HMR full-reload');
+location.reload();
+return;
+}
+if (msg && msg.type === 'update' && Array.isArray(msg.updates)) {
+for (const u of msg.updates) {
+if (u.type === 'css' && u.path) updateCss(u.path);
+else console.log('[mini-vite] HMR update (ignored)', u);
+}
+}
+} catch (err) {
+console.warn('[mini-vite] HMR invalid message', e.data);
+}
+});
+
+// debug 入口
+window.\_\_mini_vite_hmr = { ws };
+})();
+
+mini-vite/core/rewriter.js
+import path, { posix } from 'path';
+
+export function isBareImport(spec) {
+return (
+!spec.startsWith('/') &&
+!spec.startsWith('./') &&
+!spec.startsWith('../') &&
+!spec.startsWith('http://') &&
+!spec.startsWith('https://')
+);
+}
+export function isRelativeImport(spec) {
+return spec.startsWith('./') || spec.startsWith('../');
+}
+
+// ctx: { isModuleRequest?: boolean, urlBase?: string }
+export function rewriteSpecifier(spec, ctx = {}) {
+if (ctx.isModuleRequest && isRelativeImport(spec)) {
+const base = ctx.urlBase || '/';
+const absUrl = posix.normalize(posix.join(base, spec));
+return absUrl;
+}
+if (isBareImport(spec)) return `/@modules/${spec}`;
+return spec;
+}
+
+export function rewriteImports(code, ctx) {
+const R = (s) => rewriteSpecifier(s, ctx);
+code = code.replace(/from\s+(['"])([^'"]+)\1/g, (m, q, s) => `from ${q}${R(s)}${q}`);
+code = code.replace(/import\s+(['"])([^'"]+)\1/g, (m, q, s) => `import ${q}${R(s)}${q}`);
+code = code.replace(/export\s+[^;]_\s+from\s+(['"])([^'"]+)\1/g, (m, q, s) => m.replace(s, R(s)));
+code = code.replace(/import\(\s_(['"])([^'"]+)\1\s\*\)/g, (m, q, s) => `import(${q}${R(s)}${q})`);
+return code;
+}
+
+export function wrapJsonAsJs(jsonText) {
+return `export default ${jsonText};\n`;
+}
+
+// 會在首載時建立/重用 <style data-mv-href="id">
+export function wrapCssAsJs(cssText, id = '') {
+const cssStr = JSON.stringify(cssText);
+const idStr = JSON.stringify(id);
+return (
+`    const css = ${cssStr};
+    const id = ${idStr};
+    let style = document.querySelector('style[data-mv-href=' + JSON.stringify(id) + ']');
+    if (!style) {
+      style = document.createElement('style');
+      style.setAttribute('type', 'text/css');
+      if (id) style.setAttribute('data-mv-href', id);
+      document.head.appendChild(style);
+    }
+    style.innerHTML = css;
+    export default css;
+ `.trim() + '\n'
+);
+}
+
+mini-vite/core/resolver.js
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const **filename = fileURLToPath(import.meta.url);
+const **dirname = path.dirname(\_\_filename);
+
+export function parseModuleRequest(urlPath) {
+const after = urlPath.slice('/@modules/'.length);
+const segs = after.split('/').filter(Boolean);
+if (segs.length === 0) throw new Error('Invalid /@modules request');
+
+let moduleName, subPath;
+if (segs[0].startsWith('@')) {
+moduleName = segs.slice(0, 2).join('/');
+subPath = segs.slice(2).join('/');
+} else {
+moduleName = segs[0];
+subPath = segs.slice(1).join('/');
+}
+return { moduleName, subPath };
+}
+
+export function ensureJsLike(p) {
+if (path.extname(p)) return p;
+if (fs.existsSync(p + '.js')) return p + '.js';
+else if (fs.existsSync(p + '.mjs')) return p + '.mjs';
+else if (fs.existsSync(p + '.ts')) return p + '.ts';
+}
+
+export function resolveModuleEntry(moduleName, subPath) {
+// **dirname 指向 mini-vite/core
+const projectRoot = path.resolve(**dirname, '..'); // mini-vite/
+const pkgDir = path.join(projectRoot, 'node_modules', moduleName);
+const pkgJsonPath = path.join(pkgDir, 'package.json');
+if (!fs.existsSync(pkgJsonPath)) {
+throw new Error(`Cannot find package.json for ${moduleName}`);
+}
+const pkg = JSON.parse(fs.readFileSync(pkgJsonPath, 'utf-8'));
+
+if (subPath) {
+return ensureJsLike(path.join(pkgDir, subPath));
+}
+
+let candidate = null;
+if (typeof pkg.exports === 'string') candidate = pkg.exports;
+else if (pkg.exports && typeof pkg.exports === 'object' && typeof pkg.exports['.'] === 'string')
+candidate = pkg.exports['.'];
+else if (pkg.module) candidate = pkg.module;
+else if (typeof pkg.browser === 'string') candidate = pkg.browser;
+else if (typeof pkg.main === 'string') candidate = pkg.main;
+else candidate = 'index.js';
+
+return path.join(pkgDir, candidate);
+}
+
+export function safeJoin(root, urlPath) {
+const normalized = path.normalize(urlPath).replace(/^(\.\.(\/|\\|$))+/g, '');
+return path.join(root, normalized);
+}
+
+mini-vite/core/static.js
+export function getContentType(filePath) {
+if (filePath.endsWith('.html')) return 'text/html; charset=utf-8';
+if (filePath.endsWith('.js')) return 'application/javascript; charset=utf-8';
+if (filePath.endsWith('.css')) return 'text/css; charset=utf-8';
+if (filePath.endsWith('.json')) return 'application/json; charset=utf-8';
+if (filePath.endsWith('.svg')) return 'image/svg+xml';
+return 'text/plain; charset=utf-8';
+}
+
+mini-vite/index.html
+
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>mini-vite</title>
+  </head>
+  <body>
+    <h1>Mini Vite Dev</h1>
+    <div id="app"></div>
+
+    <script type="module" src="/livereload.js"></script>
+    <script type="module" src="/hmr.js"></script>
+    <script type="module" src="/src/main.js"></script>
+
+  </body>
+</html>
+
+mini-vite/src/main.js
+import './style.css';
+import data from './data.json';
+
+document.querySelector('#app').innerHTML = `
+
+  <pre>data.json = ${JSON.stringify(data, null, 2)}</pre>
+
+`;
+
+// 可選：測試裸模組（若已安裝 lodash-es）
+// import { shuffle } from 'lodash-es';
+// console.log('shuffle test', shuffle([1,2,3,4]));
+
+mini-vite/src/style.css
+body { font-family: system-ui, sans-serif; }
+h1 { margin: 16px 0; }
+#app { padding: 12px; border: 1px dashed #888; }
+
+mini-vite/src/data.json
+{ "hello": "world" }
+
+已完成能力（Day 1–9）
+
+靜態服務：正確回應 index.html 與資源（含 JSON/CSS 轉 ESM）。
+
+SSE Live Reload：/\_\_livereload + /livereload.js，支援多分頁整頁重載。
+
+裸模組解析：import "pkg" → "/@modules/pkg"；讀取 node_modules/<pkg>，優先 exports / module / browser / main；模組內相對 import 改為絕對 URL（不走 302）。
+
+JSON/CSS ESM：wrapJsonAsJs / wrapCssAsJs(css, id)（首載打 <style data-mv-href="id">）。
+
+三層重構：static / rewriter / resolver 拆分。
+
+HMR 通道：原生實作 WebSocket 握手與文字 frame；端點 ws://localhost:3000/\_\_hmr；與 SSE 並存。
+
+CSS HMR：.css 變更時 WS 廣播 { type:'update', updates:[{ type:'css', path, timestamp }] }；client 以 ?raw=1&t= 抓純 CSS 覆寫目標 <style>；
+事件穩定化：使用 debounce 進行全域整頁重載去抖與 CSS 更新聚合（Map 去重，60ms 批次送出）。
+
+後續天數規劃（Day 10–30）
+
+Day 10：Module Graph 雛形 — 解析 JS 模組直接依賴，建立 graph: url → deps[] / importers[]，供 HMR 使用。
+
+Day 11：JS HMR 基礎 — import.meta.hot.accept() 最小實作；WS update 訊息帶上受影響模組。
+
+Day 12：錯誤覆蓋層 & 快取控制 — 顯示 runtime 錯誤 overlay；簡單 ETag 或時間戳避免快取干擾。
+
+Day 13：依賴預編譯（概念版） — 把常用依賴預打包到 /deps/\*，回應時優先改寫，並加強快取標頭。
+
+Day 14：週小結 — 鞏固 CSS/JS HMR 與 pre-bundle 穩定性。
+
+Day 15：最小 Build（Rollup 單入口） — 整合 Rollup 實作生產輸出（ESM）。
+
+Day 16：多入口 / Code Splitting — 輸出拆分、動態 import。
+
+Day 17：輸出格式 — 支援 ESM / CJS 輸出。
+
+Day 18：CSS 抽離與生產注入 — 開發注入、產出抽離，link 標籤策略。
+
+Day 19：資產處理 — 圖片/字型/JSON，附檔名 hash。
+
+Day 20：環境變數 — .env 與 import.meta.env 替換。
+
+Day 21：週小結 — 完成可發佈的 build pipeline。
+
+Day 22：Plugin 介面 — resolveId / load / transform。
+
+Day 23：示範插件 — e.g. 字串替換或 Banner 注入。
+
+Day 24：框架插件 — React 或 Vue 最小可行（選一）。
+
+Day 25：別名與自訂解析 — alias、打通 resolveId。
+
+Day 26：模式切換 — dev / build 與 --mode。
+
+Day 27：快取策略 — in-memory + 檔案快取。
+
+Day 28：CLI — mini-vite dev/build/preview。
+
+Day 29：測試與範例驗收 — e2e/手動腳本。
+
+Day 30：文件與最終整理 — README、架構圖、限制與未來工作。
 ```
-
-已安裝：nodemon（dev）、可能有 lodash-es（測試裸模組用，可視需要保留）。
-
-server.js 已具備能力（不使用 302 轉址）：
-
-靜態服務：回應 index.html 與一般資源。
-
-Live Reload（SSE）：GET /\_\_livereload + /livereload.js；目前必定監看 index.html 變動並整頁重整。
-
-裸模組支援：把程式碼中的裸模組 import "pkg" 改寫為 "/@modules/pkg"，並從 node_modules/<pkg> 解析入口（優先 exports/module/browser/main）。
-
-相對匯入改寫為絕對 URL（僅在回應 /@modules/\* 檔案時）：例如套件內 ./add.js 會被改成 "/@modules/lodash-es/add.js"，全程不使用 302。
-
-Day 5：支援 JSON 與 CSS 作為 ESM 回應：
-
-\*.json → 包裝為 JS：export default <json>
-
-\*.css → 包裝為 JS：動態建立 <style> 注入，export default cssString
-
-已完成的天數
-
-Day 1：專案初始化、理解 Vite 核心與原生 ESM。
-
-Day 2：最小靜態伺服器（JS 版）。
-
-Day 3：Live Reload（SSE，監看 index.html）。
-
-Day 4：裸模組改寫與 node_modules 解析；在模組檔內把相對路徑改為絕對 URL（不走 302）。
-
-Day 5：JSON/CSS ESM 包裝（應用端與 /@modules/\* 皆支援）。
-
-Day 6：擴大檔案監聽範圍（src/\*_, _.css, \*.json）→ 變更時自動整頁重載。
-
-待完成的清單（供你依序帶我做）
-
-Day 7：小結與重構：抽出「靜態回應 / 改寫器 / 模組解析」三層。
-
-Day 8：建立 HMR 通道（WebSocket）與 update/full-reload 基本協議。
-
-Day 9：CSS HMR（更新樣式而非整頁）。
-
-Day 10：Module Graph 雛形（追蹤依賴/反向依賴）。
-
-Day 11：JS HMR：import.meta.hot.accept()。
-
-Day 12：錯誤覆蓋層（Error Overlay）與快取失效策略（ETag/時間戳）。
-
-Day 13：依賴預編譯（pre-bundling 概念版）→ 改寫至 /deps/\*，並加強快取。
-
-Day 14：週小結：穩定 HMR（CSS/JS）＋ 預編譯基本可用。
-
-Day 15：整合 Rollup 做最小生產建置（單入口）。
-
-Day 16：多入口 / Code Splitting。
-
-Day 17：輸出格式：ESM / CJS。
-
-Day 18：CSS 抽離與生產注入策略。
-
-Day 19：資產（圖/字型/JSON）與 hash 命名。
-
-Day 20：環境變數（.env）與 import.meta.env 替換。
-
-Day 21：週小結：完成可發佈的 build pipeline。
-
-Day 22：Plugin 介面：resolveId、load、transform。
-
-Day 23：示範插件（字串替換或 Banner 注入）。
-
-Day 24：框架插件（React 或 Vue 最小可行）。
-
-Day 25：別名（alias）與自訂解析（打通 resolveId）。
-
-Day 26：模式切換（dev / build；--mode）。
-
-Day 27：快取（in-memory + 檔案快取）。
-
-Day 28：CLI：mini-vite dev/build/preview。
-
-Day 29：測試與範例專案驗收。
-
-Day 30：文件與最終整理（README、架構圖、限制與未來工作）。
-
-互動規則（請嚴格遵守）
-
-先給完整檔案 → 再給測試步驟 → 再給驗收條件 → 最後 3–5 句原理說明。
-
-保持 JS 版本；不升級 TypeScript，也不要引入不必要的第三方依賴。
-
-持續沿用「不使用 302」的策略；對 /@modules/\* 的回應中，將相對 import 改為絕對 URL。
-
-若需新增檔案/端點，務必標示完整路徑與用途；對現有檔案，盡量提供最小 diff。
-
-若功能可分步落地，優先讓第一步先可用，再漸進擴充。
-
-現在請從 Day 7 開始帶我做；若我輸入「開始 Day X」，你就跳到指定天數，按照上面格式輸出。
