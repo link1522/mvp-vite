@@ -1,7 +1,7 @@
 你現在要扮演我的教練，帶我完成「30 天打造迷你 Vite」計畫。
 請嚴格遵守輸出格式：先給完整檔案 → 再給測試步驟 → 再給驗收標準 → 最後 3–5 句原理說明。
 全程以 JavaScript（非 TypeScript） 實作；不引入不必要套件；不使用 302。
-我會用「開始 Day X」來指定天數；若我沒指定，預設從 Day 10 開始。
+我會用「開始 Day X」來指定天數；若我沒指定，預設從 Day 11 開始。
 
 專案狀態（請記住）
 
@@ -26,6 +26,7 @@ mini-vite/
 ├─ server.js
 ├─ hmr.js
 ├─ core/
+│ ├─ graph.js
 │ ├─ rewriter.js
 │ ├─ resolver.js
 │ └─ static.js
@@ -47,18 +48,22 @@ import crypto from 'crypto';
 
 import { rewriteImports, wrapCssAsJs, wrapJsonAsJs } from './core/rewriter.js';
 import {
-parseModuleRequest,
-resolveModuleEntry,
-safeJoin
+  parseModuleRequest,
+  resolveModuleEntry,
+  safeJoin
 } from './core/resolver.js';
 import { getContentType } from './core/static.js';
+import { ModuleGraph } from './core/graph.js';
+import { url } from 'inspector';
 
-const **filename = fileURLToPath(import.meta.url);
-const **dirname = path.dirname(\_\_filename);
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const PORT = 3000;
+const moduleGraph = new ModuleGraph();
 
-const livereloadClientJs = `// live reload (SSE)
+const livereloadClientJs = `
+// live reload
 const src = location.origin + '/__livereload';
 const es = new EventSource(src);
 es.addEventListener('message', e => {
@@ -72,128 +77,138 @@ es.addEventListener('open', () =>
 );
 es.addEventListener('error', () =>
   console.log('[mini-vite] Live reload disconnected')
-);`;
+);
+`;
 
-// ===== SSE =====
+// 儲存所有連線中 SSE 回應 (多分頁也能一起刷新)
 const sseClients = new Set();
+
+// 廣播 reload
 function boroadcastReload() {
-const payload = 'data: reload\n\n';
-for (const res of sseClients) {
-try { res.write(payload); } catch (\_) {}
-}
+  const payload = 'data: reload\n\n';
+  for (const res of sseClients) {
+    try {
+      res.write(payload);
+    } catch (_) {}
+  }
 }
 
-// ===== HMR (WebSocket) =====
+// ========== HMR (WebSocket) ==========
+
 const wsClients = new Set();
 
 function createWsAccept(key) {
-const GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
-const sha1 = crypto.createHash('sha1');
-sha1.update(key + GUID);
-return sha1.digest('base64');
+  const GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
+  const sha1 = crypto.createHash('sha1');
+  sha1.update(key + GUID);
+  return sha1.digest('base64');
 }
 
 function encodeWsTextFrame(str) {
-const payload = Buffer.from(str);
-const len = payload.length;
-let header;
-if (len < 126) {
-header = Buffer.alloc(2);
-header[0] = 0x81; // FIN + text
-header[1] = len; // server->client 無 mask
-} else if (len < 65536) {
-header = Buffer.alloc(4);
-header[0] = 0x81;
-header[1] = 126;
-header.writeUInt16BE(len, 2);
-} else {
-header = Buffer.alloc(10);
-header[0] = 0x81;
-header[1] = 127;
-header.writeUInt32BE(0, 2);
-header.writeUInt32BE(len, 6);
-}
-return Buffer.concat([header, payload]);
+  const payload = Buffer.from(str);
+  const len = payload.length;
+  let header;
+  if (len < 126) {
+    header = Buffer.alloc(2);
+    header[0] = 0x81;
+    header[1] = len;
+  } else if (len < 65536) {
+    header = Buffer.alloc(4);
+    header[0] = 0x81;
+    header[1] = 126;
+    header.writeUInt16BE(len, 2);
+  } else {
+    header = Buffer.alloc(10);
+    header[0] = 0x81;
+    header[1] = 127;
+    header.writeUInt32BE(0, 2);
+    header.writeUInt32BE(len, 6);
+  }
+  return Buffer.concat([header, payload]);
 }
 
 function wsBroadcast(obj) {
-const msg = JSON.stringify(obj);
-const frame = encodeWsTextFrame(msg);
-for (const sock of wsClients) {
-try { sock.write(frame); } catch {}
-}
+  const msg = JSON.stringify(obj);
+  const frame = encodeWsTextFrame(msg);
+  for (const sock of wsClients) {
+    try {
+      sock.write(frame);
+    } catch {}
+  }
 }
 
-// ===== debounce 工具 =====
 function debounce(fn, ms) {
-let t = null;
-return (...args) => {
-clearTimeout(t);
-t = setTimeout(() => fn(...args), ms);
-};
+  let t = null;
+  return (...args) => {
+    clearTimeout(t);
+    t = setTimeout(() => fn(...args), ms);
+  };
 }
 
-// 全頁重載（合併多次）
 const debouncedReload = debounce(() => {
-console.log('[mini-vite] change detected → reload');
-boroadcastReload();
-wsBroadcast({ type: 'full-reload' });
+  console.log('[mini-vite] change detected → reload');
+  boroadcastReload();
+  wsBroadcast({ type: 'full-reload' });
 }, 60);
 
-// CSS 更新聚合（同一視窗去重）
-const updatesQueue = new Map(); // Map<path, { type, path, timestamp }>
+const updatesQueue = new Map(); // Map<path, {type, path, timestamp}>
 const flushUpdates = debounce(() => {
-const updates = Array.from(updatesQueue.values());
-updatesQueue.clear();
-if (updates.length) {
-wsBroadcast({ type: 'update', updates });
-}
+  const updates = Array.from(updatesQueue.values());
+  updatesQueue.clear();
+  wsBroadcast({ type: 'update', updates });
 }, 60);
+
 function enqueueCssUpdate(cssPath) {
-updatesQueue.set(cssPath, { type: 'css', path: cssPath, timestamp: Date.now() });
-flushUpdates();
+  updatesQueue.set(cssPath, {
+    type: 'css',
+    path: cssPath,
+    timestamp: Date.now()
+  });
+  flushUpdates();
 }
 
-// ===== 監看與通知 =====
 function toUrlPath(absPath) {
-const rel = path.relative(\_\_dirname, absPath);
-if (!rel || rel.startsWith('..')) return null;
-return '/' + rel.split(path.sep).join(posix.sep);
+  const rel = path.relative(__dirname, absPath);
+  if (!rel || rel.startsWith('..')) return null;
+  return '/' + rel.split(path.sep).join(posix.sep);
 }
 
 function notifyFileChanged(absFullPath) {
-const urlPath = toUrlPath(absFullPath);
-if (!urlPath) return debouncedReload();
+  const urlPath = toUrlPath(absFullPath);
+  if (!urlPath) return debouncedReload();
 
-const ext = path.extname(urlPath).toLowerCase();
-if (ext === '.css') {
-console.log('[mini-vite] css update →', urlPath);
-enqueueCssUpdate(urlPath);
-return;
-}
+  const ext = path.extname(urlPath).toLowerCase();
+  if (ext === '.css') {
+    console.log('[mini-vite] css update →', urlPath);
+    enqueueCssUpdate(urlPath);
+    return;
+  }
 
-debouncedReload();
+  debouncedReload();
 }
 
 const watchedDirs = new Set();
 function watchDirRecursive(dir) {
-if (!fs.existsSync(dir)) return;
-const real = fs.realpathSync(dir);
-if (watchedDirs.has(real)) return;
-watchedDirs.add(real);
+  if (!fs.existsSync(dir)) return;
+  const real = fs.realpathSync(dir);
+  if (watchedDirs.has(real)) return;
+  watchedDirs.add(real);
 
-try {
-fs.watch(real, { persistent: true }, (eventType, filename) => {
-if (filename) {
-const full = path.join(real, filename);
-fs.promises.stat(full).then((st) => {
-if (st.isDirectory()) watchDirRecursive(full);
-}).catch(() => {});
-notifyFileChanged(full);
-} else {
-debouncedReload();
-}
-});
+  try {
+    fs.watch(real, { persistent: true }, (eventType, filename) => {
+      if (filename) {
+        const full = path.join(real, filename);
+        fs.promises
+          .stat(full)
+          .then(st => {
+            if (st.isDirectory()) watchDirRecursive(full);
+          })
+          .catch(() => {});
+        notifyFileChanged(full);
+      } else {
+        debouncedReload();
+      }
+    });
 
     for (const entry of fs.readdirSync(real)) {
       const sub = path.join(real, entry);
@@ -202,61 +217,67 @@ debouncedReload();
         if (st.isDirectory()) watchDirRecursive(sub);
       } catch {}
     }
-
-} catch (e) {}
+  } catch (e) {}
 }
 
-// 單檔監看（index.html 仍整頁刷新）
-const INDEX_PATH = path.join(\_\_dirname, 'index.html');
-fs.watch(INDEX_PATH, { persistent: true }, (eventType) => {
-if (eventType === 'change') {
-console.log('[mini-vite] index.html changed → reload');
-boroadcastReload();
-wsBroadcast({ type: 'full-reload', path: '/index.html' });
-}
+// 監聽 index.html
+const INDEX_PATH = path.join(__dirname, 'index.html');
+fs.watch(INDEX_PATH, { persistent: true }, eventType => {
+  if (eventType === 'change') {
+    console.log('[mini-vite] index.html changed → reload');
+    boroadcastReload();
+    wsBroadcast({ type: 'full-reload', path: '/index.html' });
+  }
 });
 
-// 監看 src/\*\*
-const SRC_DIR = path.join(\_\_dirname, 'src');
+// 監聽 src/**
+const SRC_DIR = path.join(__dirname, 'src');
 watchDirRecursive(SRC_DIR);
 
-fs.watch(\_\_dirname);
+fs.watch(__dirname);
 
-// ===== HTTP Server =====
+// server 主程式
 const server = http.createServer((req, res) => {
-const rawUrl = decodeURIComponent(req.url || '/');
-const u = new URL(rawUrl, 'http://localhost'); // 解析出 pathname + search
-const urlPath = u.pathname;
+  const rawUrl = decodeURIComponent(req.url || '/');
+  const u = new URL(rawUrl, 'http://localhost');
+  const urlPath = u.pathname;
 
-// SSE 端點
-if (urlPath === '/\_\_livereload') {
-res.writeHead(200, {
-'content-type': 'text/event-stream',
-'cache-control': 'no-cache, no-transform',
-connection: 'keep-alive',
-'access-control-allow-origin': '\*'
-});
-res.write('retry: 1000\n\n');
-sseClients.add(res);
-req.on('close', () => sseClients.delete(res));
-return;
-}
+  if (urlPath === '/__graph.json') {
+    res.writeHead(200, {
+      'content-type': 'application/json; charset=utf-8',
+      'cache-control': 'no-store'
+    });
+    res.end(JSON.stringify(moduleGraph.toJSON(), null, 2));
+    return;
+  }
 
-// /livereload.js
-if (urlPath === '/livereload.js') {
-res.writeHead(200, {
-'content-type': 'application/javascript; charset=utf-8',
-'cache-control': 'no-store'
-});
-res.end(livereloadClientJs);
-return;
-}
+  // sse 端點
+  if (urlPath === '/__livereload') {
+    res.writeHead(200, {
+      'content-type': 'text/event-stream',
+      'cache-control': 'no-cache, no-transform',
+      connection: 'keep-alive',
+      'access-control-allow-origin': '*'
+    });
+    res.write('retry: 1000\n\n'); // 斷線後 1s 嘗試重連
+    sseClients.add(res);
+    req.on('close', () => sseClients.delete(res));
+    return;
+  }
 
-// 裸模組：/@modules/\*\*
-if (urlPath.startsWith('/@modules/')) {
-try {
-const { moduleName, subPath } = parseModuleRequest(urlPath);
-const absPath = resolveModuleEntry(moduleName, subPath);
+  if (urlPath === '/livereload.js') {
+    res.writeHead(200, {
+      'content-type': 'application/javascript; charset=utf-8',
+      'cache-control': 'no-store'
+    });
+    res.end(livereloadClientJs);
+    return;
+  }
+
+  if (urlPath.startsWith('/@modules/')) {
+    try {
+      const { moduleName, subPath } = parseModuleRequest(urlPath);
+      const absPath = resolveModuleEntry(moduleName, subPath);
 
       let baseFromSub = '';
       if (subPath) {
@@ -271,6 +292,8 @@ const absPath = resolveModuleEntry(moduleName, subPath);
         urlBase
       });
 
+      moduleGraph.recordFromCode(urlPath, transformed);
+
       res.writeHead(200, {
         'content-type': 'application/javascript; charset=utf-8',
         'cache-control': 'no-store'
@@ -281,21 +304,24 @@ const absPath = resolveModuleEntry(moduleName, subPath);
       res.end(`[mini-vite] Failed to resolve module: ${err.message}`);
     }
     return;
+  }
 
-}
+  const filePath = safeJoin(
+    __dirname,
+    urlPath === '/' ? '/index.html' : urlPath
+  );
 
-// 一般靜態（支援 ?raw 供 CSS HMR 抓純樣式）
-const filePath = safeJoin(\_\_dirname, urlPath === '/' ? '/index.html' : urlPath);
-
-fs.readFile(filePath, (err, data) => {
-if (err) {
-const isNotFound = err.code === 'ENOENT';
-const status = isNotFound ? 404 : 500;
-const message = isNotFound ? 'Not Found' : `Server error: ${err.message}`;
-res.writeHead(status, { 'content-type': 'text/plain; charset=utf-8' });
-res.end(message);
-return;
-}
+  fs.readFile(filePath, (err, data) => {
+    if (err) {
+      const isNotFound = err.code === 'ENOENT';
+      const status = isNotFound ? 404 : 500;
+      const message = isNotFound ? 'Not Found' : `Server error: ${err.message}`;
+      res.writeHead(status, {
+        'content-type': 'text/plain; charset=utf-8'
+      });
+      res.end(message);
+      return;
+    }
 
     const lower = filePath.toLowerCase();
 
@@ -309,7 +335,7 @@ return;
     }
 
     if (lower.endsWith('.css')) {
-      const isRaw = u.searchParams.has('raw'); // for HMR
+      const isRaw = u.searchParams.has('raw');
       if (isRaw) {
         res.writeHead(200, {
           'content-type': 'text/css; charset=utf-8',
@@ -327,50 +353,60 @@ return;
     }
 
     const ct = getContentType(filePath);
-    res.writeHead(200, { 'Content-Type': ct, 'cache-control': 'no-store' });
+
+    res.writeHead(200, {
+      'Content-Type': ct,
+      'cache-control': 'no-store'
+    });
 
     if (ct === 'application/javascript; charset=utf-8') {
       const transformed = rewriteImports(data.toString('utf-8'));
+      moduleGraph.recordFromCode(urlPath, transformed);
       res.end(transformed);
     } else {
       res.end(data);
     }
-
+  });
 });
-});
 
-// WebSocket 升級：/**hmr
+// WebSocket 升級握手: /__hmr
 server.on('upgrade', (req, socket) => {
-if (!req.url || !req.url.startsWith('/**hmr')) {
-socket.destroy();
-return;
-}
-const key = req.headers['sec-websocket-key'];
-const version = req.headers['sec-websocket-version'];
-if (!key || version !== '13') {
-socket.destroy();
-return;
-}
+  if (!req.url || !req.url.startsWith('/__hmr')) {
+    socket.destroy();
+    return;
+  }
+  const key = req.headers['sec-websocket-key'];
+  const version = req.headers['sec-websocket-version'];
+  if (!key || version !== '13') {
+    socket.destroy();
+    return;
+  }
 
-const accept = createWsAccept(String(key));
-const headers = [
-'HTTP/1.1 101 Switching Protocols',
-'Upgrade: websocket',
-'Connection: Upgrade',
-`Sec-WebSocket-Accept: ${accept}`
-];
-socket.write(headers.join('\r\n') + '\r\n\r\n');
+  const accept = createWsAccept(String(key));
+  const headers = [
+    'HTTP/1.1 101 Switching Protocols',
+    'Upgrade: websocket',
+    'Connection: Upgrade',
+    `Sec-WebSocket-Accept: ${accept}`
+  ];
+  socket.write(headers.join('\r\n') + '\r\n\r\n');
 
-wsClients.add(socket);
-socket.on('close', () => wsClients.delete(socket));
-socket.on('end', () => wsClients.delete(socket));
-socket.on('error', () => wsClients.delete(socket));
-socket.on('data', () => {}); // 暫不處理 client->server
+  wsClients.add(socket);
+  socket.on('close', () => wsClients.delete(socket));
+  socket.on('end', () => wsClients.delete(socket));
+  socket.on('error', () => wsClients.delete(socket));
+
+  // 目前不處理 client->server 訊息；忽略資料（可在 Day 11 擴充）
+  socket.on('data', () => {});
 });
 
 server.listen(PORT, () => {
-console.log(`Mini Vite dev server with Live Reload & HMR at http://localhost:${PORT}`);
+  console.log(
+    `Mini Vite dev server with Live Reload at http://localhost:${PORT}`
+  );
+  console.log('Module graph endpoint: http://localhost:%d/__graph.json', PORT);
 });
+
 
 mini-vite/hmr.js
 // 最小 HMR 客戶端（WS）：支援 full-reload 與 CSS update
@@ -426,6 +462,110 @@ console.warn('[mini-vite] HMR invalid message', e.data);
 // debug 入口
 window.\_\_mini_vite_hmr = { ws };
 })();
+
+mini-vite/core/graph.js
+import { posix } from 'path';
+
+export function scanImports(code) {
+  const specs = new Set();
+
+  const reFrom = /(?:import|export)\s+[^'";]*?\bfrom\s*(['"])([^'"]+)\1/g;
+  const reBare = /\bimport\s*(['"])([^'"]+)\1/g;
+  const reDyn = /\bimport\s*\(\s*(['"])([^'"]+)\1\s*\)/g;
+
+  let m;
+  while ((m = reFrom.exec(code))) specs.add(m[2]);
+  while ((m = reBare.exec(code))) specs.add(m[2]);
+  while ((m = reDyn.exec(code))) specs.add(m[2]);
+
+  return Array.from(specs);
+}
+
+function isAbs(u) {
+  return u.startsWith('/');
+}
+
+function isRel(u) {
+  return u.startsWith('./') || u.startsWith('../');
+}
+
+function isHttp(u) {
+  return u.startsWith('http://') || u.startsWith('https://');
+}
+
+export function normalizeImport(spec, importerUrlPath) {
+  if (isHttp(spec)) return null;
+  if (isAbs(spec)) return spec;
+  if (isRel(spec)) {
+    const base = posix.dirname(importerUrlPath);
+    const joined = posix.normalize(posix.join(base, spec));
+    return joined.startsWith('/') ? joined : '/' + joined;
+  }
+  return '/@modules/' + spec;
+}
+
+class ModuleNode {
+  constructor(url) {
+    this.url = url;
+    // 這個模組 import 了那些模組
+    this.deps = new Set();
+    // 哪寫模組 import 了這個模組
+    this.importers = new Set();
+  }
+}
+
+export class ModuleGraph {
+  constructor() {
+    this.nodes = new Map();
+  }
+
+  ensure(url) {
+    let n = this.nodes.get(url);
+    if (!n) {
+      n = new ModuleNode(url);
+      this.nodes.set(url, n);
+    }
+    return n;
+  }
+
+  setDeps(url, depList) {
+    const node = this.ensure(url);
+    const next = new Set(depList);
+
+    for (const d of node.deps) {
+      if (!next.has(d)) {
+        const depNode = this.nodes.get(d);
+        if (depNode) depNode.importers.delete(url);
+        node.deps.delete(d);
+      }
+    }
+
+    for (const d of next) {
+      node.deps.add(d);
+      this.ensure(d).importers.add(url);
+    }
+  }
+
+  recordFromCode(url, transformedCode) {
+    const specs = scanImports(transformedCode);
+    const deps = specs
+      .map(s => normalizeImport(s, url))
+      .filter(s => Boolean(s));
+
+    this.setDeps(url, deps);
+  }
+
+  toJSON() {
+    return {
+      nodes: Array.from(this.nodes.values()).map(n => ({
+        url: n.url,
+        deps: Array.from(n.deps),
+        importers: Array.from(n.importers)
+      }))
+    };
+  }
+}
+
 
 mini-vite/core/rewriter.js
 import path, { posix } from 'path';
@@ -600,26 +740,21 @@ h1 { margin: 16px 0; }
 mini-vite/src/data.json
 { "hello": "world" }
 
-已完成能力（Day 1–9）
+已完成能力（Day 1–10）
 
-靜態服務：正確回應 index.html 與資源（含 JSON/CSS 轉 ESM）。
+靜態資源服務（含 JSON/CSS → ESM 包裝）
+SSE Live Reload
+裸模組解析（/@modules/pkg → node_modules/pkg/...）
+CSS HMR（使用 ?raw 請求並替換 <style>）
+debounce 穩定化 reload / CSS 更新聚合
+三層結構：rewriter / resolver / static 拆分
+HMR 通道（WebSocket 原生握手與訊息推送）
+新增 core/graph.js
+建立 Module Graph（url → deps[] / importers[]）
+每次傳送 JS 模組時記錄其依賴關係
+提供 /__graph.json 端點檢視當前模組圖
 
-SSE Live Reload：/\_\_livereload + /livereload.js，支援多分頁整頁重載。
-
-裸模組解析：import "pkg" → "/@modules/pkg"；讀取 node_modules/<pkg>，優先 exports / module / browser / main；模組內相對 import 改為絕對 URL（不走 302）。
-
-JSON/CSS ESM：wrapJsonAsJs / wrapCssAsJs(css, id)（首載打 <style data-mv-href="id">）。
-
-三層重構：static / rewriter / resolver 拆分。
-
-HMR 通道：原生實作 WebSocket 握手與文字 frame；端點 ws://localhost:3000/\_\_hmr；與 SSE 並存。
-
-CSS HMR：.css 變更時 WS 廣播 { type:'update', updates:[{ type:'css', path, timestamp }] }；client 以 ?raw=1&t= 抓純 CSS 覆寫目標 <style>；
-事件穩定化：使用 debounce 進行全域整頁重載去抖與 CSS 更新聚合（Map 去重，60ms 批次送出）。
-
-後續天數規劃（Day 10–30）
-
-Day 10：Module Graph 雛形 — 解析 JS 模組直接依賴，建立 graph: url → deps[] / importers[]，供 HMR 使用。
+後續天數規劃（Day 11–30）
 
 Day 11：JS HMR 基礎 — import.meta.hot.accept() 最小實作；WS update 訊息帶上受影響模組。
 
