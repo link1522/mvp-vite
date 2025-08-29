@@ -11,11 +11,14 @@ import {
   safeJoin
 } from './core/resolver.js';
 import { getContentType } from './core/static.js';
+import { ModuleGraph } from './core/graph.js';
+import { url } from 'inspector';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const PORT = 3000;
+const moduleGraph = new ModuleGraph();
 
 const livereloadClientJs = `
 // live reload
@@ -155,7 +158,7 @@ function watchDirRecursive(dir) {
         const full = path.join(real, filename);
         fs.promises
           .stat(full)
-          .then((st) => {
+          .then(st => {
             if (st.isDirectory()) watchDirRecursive(full);
           })
           .catch(() => {});
@@ -177,7 +180,7 @@ function watchDirRecursive(dir) {
 
 // 監聽 index.html
 const INDEX_PATH = path.join(__dirname, 'index.html');
-fs.watch(INDEX_PATH, { persistent: true }, (eventType) => {
+fs.watch(INDEX_PATH, { persistent: true }, eventType => {
   if (eventType === 'change') {
     console.log('[mini-vite] index.html changed → reload');
     boroadcastReload();
@@ -196,6 +199,15 @@ const server = http.createServer((req, res) => {
   const rawUrl = decodeURIComponent(req.url || '/');
   const u = new URL(rawUrl, 'http://localhost');
   const urlPath = u.pathname;
+
+  if (urlPath === '/__graph.json') {
+    res.writeHead(200, {
+      'content-type': 'application/json; charset=utf-8',
+      'cache-control': 'no-store'
+    });
+    res.end(JSON.stringify(moduleGraph.toJSON(), null, 2));
+    return;
+  }
 
   // sse 端點
   if (urlPath === '/__livereload') {
@@ -237,6 +249,8 @@ const server = http.createServer((req, res) => {
         isModuleRequest: true,
         urlBase
       });
+
+      moduleGraph.recordFromCode(urlPath, transformed);
 
       res.writeHead(200, {
         'content-type': 'application/javascript; charset=utf-8',
@@ -305,6 +319,7 @@ const server = http.createServer((req, res) => {
 
     if (ct === 'application/javascript; charset=utf-8') {
       const transformed = rewriteImports(data.toString('utf-8'));
+      moduleGraph.recordFromCode(urlPath, transformed);
       res.end(transformed);
     } else {
       res.end(data);
@@ -347,4 +362,5 @@ server.listen(PORT, () => {
   console.log(
     `Mini Vite dev server with Live Reload at http://localhost:${PORT}`
   );
+  console.log('Module graph endpoint: http://localhost:%d/__graph.json', PORT);
 });
