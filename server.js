@@ -12,7 +12,6 @@ import {
 } from './core/resolver.js';
 import { getContentType } from './core/static.js';
 import { ModuleGraph } from './core/graph.js';
-import { url } from 'inspector';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -125,6 +124,30 @@ function enqueueCssUpdate(cssPath) {
   flushUpdates();
 }
 
+function enqueueJsUpdate(jsPath) {
+  const affected = moduleGraph.collectAffected(jsPath);
+  updatesQueue.set(jsPath, {
+    type: 'js',
+    path: jsPath,
+    timestamp: Date.now(),
+    affected
+  });
+  flushUpdates();
+}
+
+function isJsExt(p) {
+  const ext = path.extname(p).toLowerCase();
+  return ext === '.js' || ext === '.mjs' || ext === '.cjs';
+}
+
+// 將 import.meta.hot 注入每個 JS 模組
+function injectImportMetaHot(code, urlPath) {
+  const header =
+    `import { createHotContext as __mv_createHotContext } from "/hmr.js";\n` +
+    `import.meta.hot = __mv_createHotContext(${JSON.stringify(urlPath)});\n`;
+  return header + code;
+}
+
 function toUrlPath(absPath) {
   const rel = path.relative(__dirname, absPath);
   if (!rel || rel.startsWith('..')) return null;
@@ -139,6 +162,12 @@ function notifyFileChanged(absFullPath) {
   if (ext === '.css') {
     console.log('[mini-vite] css update →', urlPath);
     enqueueCssUpdate(urlPath);
+    return;
+  }
+
+  if (isJsExt(urlPath)) {
+    console.log('[mini-vite] js update →', urlPath);
+    enqueueJsUpdate(urlPath);
     return;
   }
 
@@ -250,13 +279,14 @@ const server = http.createServer((req, res) => {
         urlBase
       });
 
-      moduleGraph.recordFromCode(urlPath, transformed);
+      const withHmr = injectImportMetaHot(transformed, urlPath);
+      moduleGraph.recordFromCode(urlPath, withHmr);
 
       res.writeHead(200, {
         'content-type': 'application/javascript; charset=utf-8',
         'cache-control': 'no-store'
       });
-      res.end(transformed);
+      res.end(withHmr);
     } catch (err) {
       res.writeHead(500, { 'content-type': 'text/plain; charset=utf-8' });
       res.end(`[mini-vite] Failed to resolve module: ${err.message}`);
@@ -319,8 +349,9 @@ const server = http.createServer((req, res) => {
 
     if (ct === 'application/javascript; charset=utf-8') {
       const transformed = rewriteImports(data.toString('utf-8'));
-      moduleGraph.recordFromCode(urlPath, transformed);
-      res.end(transformed);
+      const withHmr = injectImportMetaHot(transformed, urlPath);
+      moduleGraph.recordFromCode(urlPath, withHmr);
+      res.end(withHmr);
     } else {
       res.end(data);
     }

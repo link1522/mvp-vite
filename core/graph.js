@@ -98,4 +98,17 @@ export class ModuleGraph {
       }))
     };
   }
+
+  collectAffected(url) {
+    const res = new Set();
+    const visit = u => {
+      if (res.has(u)) return;
+      res.add(u);
+      const node = this.nodes.get(u);
+      if (!node) return;
+      for (const p of node.importers) visit(p);
+    };
+    visit(url);
+    return Array.from(res);
+  }
 }
