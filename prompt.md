@@ -1,7 +1,10 @@
 你現在要扮演我的教練，帶我完成「30 天打造迷你 Vite」計畫。
 請嚴格遵守輸出格式：先給完整檔案 → 再給測試步驟 → 再給驗收標準 → 最後 3–5 句原理說明。
-全程以 JavaScript（非 TypeScript） 實作；不引入不必要套件；不使用 302。
-我會用「開始 Day X」來指定天數；若我沒指定，預設從 Day 11 開始。
+全程以 JavaScript（非 TypeScript） 實作；不引入不必要套件
+有修改的部分要用註解標示，例如:
+// ===================== 修改開始 ======================
+// ===================== 修改結束 ======================
+我會用「開始 Day X」來指定天數；若我沒指定，預設從 Day 12 開始。
 
 專案狀態（請記住）
 
@@ -39,7 +42,9 @@ mini-vite/
 ```
 
 現有檔案內容（以此為準）
-mini-vite/server.js
+
+### mini-vite/server.js
+
 import http from 'http';
 import fs from 'fs';
 import path, { posix } from 'path';
@@ -54,7 +59,6 @@ import {
 } from './core/resolver.js';
 import { getContentType } from './core/static.js';
 import { ModuleGraph } from './core/graph.js';
-import { url } from 'inspector';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -167,6 +171,30 @@ function enqueueCssUpdate(cssPath) {
   flushUpdates();
 }
 
+function enqueueJsUpdate(jsPath) {
+  const affected = moduleGraph.collectAffected(jsPath);
+  updatesQueue.set(jsPath, {
+    type: 'js',
+    path: jsPath,
+    timestamp: Date.now(),
+    affected
+  });
+  flushUpdates();
+}
+
+function isJsExt(p) {
+  const ext = path.extname(p).toLowerCase();
+  return ext === '.js' || ext === '.mjs' || ext === '.cjs';
+}
+
+// 將 import.meta.hot 注入每個 JS 模組
+function injectImportMetaHot(code, urlPath) {
+  const header =
+    `import { createHotContext as __mv_createHotContext } from "/hmr.js";\n` +
+    `import.meta.hot = __mv_createHotContext(${JSON.stringify(urlPath)});\n`;
+  return header + code;
+}
+
 function toUrlPath(absPath) {
   const rel = path.relative(__dirname, absPath);
   if (!rel || rel.startsWith('..')) return null;
@@ -181,6 +209,12 @@ function notifyFileChanged(absFullPath) {
   if (ext === '.css') {
     console.log('[mini-vite] css update →', urlPath);
     enqueueCssUpdate(urlPath);
+    return;
+  }
+
+  if (isJsExt(urlPath)) {
+    console.log('[mini-vite] js update →', urlPath);
+    enqueueJsUpdate(urlPath);
     return;
   }
 
@@ -292,13 +326,14 @@ const server = http.createServer((req, res) => {
         urlBase
       });
 
-      moduleGraph.recordFromCode(urlPath, transformed);
+      const withHmr = injectImportMetaHot(transformed, urlPath);
+      moduleGraph.recordFromCode(urlPath, withHmr);
 
       res.writeHead(200, {
         'content-type': 'application/javascript; charset=utf-8',
         'cache-control': 'no-store'
       });
-      res.end(transformed);
+      res.end(withHmr);
     } catch (err) {
       res.writeHead(500, { 'content-type': 'text/plain; charset=utf-8' });
       res.end(`[mini-vite] Failed to resolve module: ${err.message}`);
@@ -361,8 +396,9 @@ const server = http.createServer((req, res) => {
 
     if (ct === 'application/javascript; charset=utf-8') {
       const transformed = rewriteImports(data.toString('utf-8'));
-      moduleGraph.recordFromCode(urlPath, transformed);
-      res.end(transformed);
+      const withHmr = injectImportMetaHot(transformed, urlPath);
+      moduleGraph.recordFromCode(urlPath, withHmr);
+      res.end(withHmr);
     } else {
       res.end(data);
     }
@@ -396,7 +432,6 @@ server.on('upgrade', (req, socket) => {
   socket.on('end', () => wsClients.delete(socket));
   socket.on('error', () => wsClients.delete(socket));
 
-  // 目前不處理 client->server 訊息；忽略資料（可在 Day 11 擴充）
   socket.on('data', () => {});
 });
 
@@ -407,63 +442,112 @@ server.listen(PORT, () => {
   console.log('Module graph endpoint: http://localhost:%d/__graph.json', PORT);
 });
 
+### mini-vite/hmr.js
 
-mini-vite/hmr.js
-// 最小 HMR 客戶端（WS）：支援 full-reload 與 CSS update
-(function () {
 const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-const url = proto + '//' + location.host + '/\_\_hmr';
+const url = proto + '//' + location.host + '/__hmr';
 const ws = new WebSocket(url);
 
-ws.addEventListener('open', () => console.log('[mini-vite] HMR connected'));
-ws.addEventListener('close', () => console.log('[mini-vite] HMR disconnected'));
-
-async function updateCss(path) {
-try {
-const sep = path.includes('?') ? '&' : '?';
-const res = await fetch(path + sep + 'raw=1&t=' + Date.now(), { cache: 'no-store' });
-const css = await res.text();
-const styles = document.querySelectorAll('style[data-mv-href="' + path + '"]');
-if (styles.length) {
-styles.forEach((el) => (el.textContent = css));
-} else {
-const el = document.createElement('style');
-el.setAttribute('type', 'text/css');
-el.setAttribute('data-mv-href', path);
-el.textContent = css;
-document.head.appendChild(el);
-}
-console.log('[mini-vite] HMR(css): updated', path);
-} catch (e) {
-console.warn('[mini-vite] HMR(css) failed, fallback to reload', e);
-location.reload();
-}
-}
-
-ws.addEventListener('message', (e) => {
-try {
-const msg = JSON.parse(e.data);
-if (msg && msg.type === 'full-reload') {
-console.log('[mini-vite] HMR full-reload');
-location.reload();
-return;
-}
-if (msg && msg.type === 'update' && Array.isArray(msg.updates)) {
-for (const u of msg.updates) {
-if (u.type === 'css' && u.path) updateCss(u.path);
-else console.log('[mini-vite] HMR update (ignored)', u);
-}
-}
-} catch (err) {
-console.warn('[mini-vite] HMR invalid message', e.data);
-}
+ws.addEventListener('open', () => {
+  console.log('[mini-vite] HMR connected');
 });
 
-// debug 入口
-window.\_\_mini_vite_hmr = { ws };
-})();
+ws.addEventListener('close', () => {
+  console.log('[mini-vite] HMR disconnected');
+});
 
-mini-vite/core/graph.js
+const hotModules = new Map(); // Map<urlPath, acceptCallback>
+
+export function createHotContext(urlPath) {
+  return {
+    accept(cb) {
+      if (typeof cb !== 'function') {
+        console.warn('[mini-vite] hot.accept expects a callback');
+        return;
+      }
+      hotModules.set(urlPath, cb);
+    },
+    dispose() {},
+    invalidate() {
+      location.reload();
+    }
+  };
+}
+
+async function updateCss(path) {
+  try {
+    const sep = path.includes('?') ? '&' : '?';
+    const res = await fetch(path + sep + 'raw=1&t=' + Date.now(), {
+      cache: 'no-cache'
+    });
+    const css = await res.text();
+    const style = document.querySelectorAll(`style[data-mv-href="${path}"]`);
+    if (style.length) {
+      style.forEach(el => (el.textContent = css));
+    } else {
+      const el = document.createElement('style');
+      el.setAttribute('type', 'text/css');
+      el.setAttribute('data-mv-href', path);
+      el.textContent = css;
+      document.head.appendChild(el);
+    }
+    console.log('[mini-vite] HMR(css): updated', path);
+  } catch (e) {
+    console.warn('[mini-vite] HMR(css) failed, fallback to reload', e);
+    location.reload();
+  }
+}
+
+async function updateJsSelf(path, timestamp) {
+  const cb = hotModules.get(path);
+  if (!cb) {
+    console.log('[mini-vite] No hot.accept for', path, '→ full reload');
+    location.reload();
+    return;
+  }
+
+  try {
+    const sep = path.includes('?') ? '&' : '?';
+    const mod = await import(path + sep + 't=' + (timestamp || Date.now()));
+    await cb(mod);
+    console.log('[mini-vite] HMR(js): accepted', path);
+  } catch (e) {
+    console.log('[mini-vite] HMR(js) failed, fallback to reload', e);
+    location.reload();
+  }
+}
+
+ws.addEventListener('message', e => {
+  try {
+    const msg = JSON.parse(e.data);
+    if (msg && msg.type === 'full-reload') {
+      console.log('[mini-vite] HMR full-reload');
+      location.reload();
+      return;
+    }
+
+    if (msg && msg.type === 'update' && Array.isArray(msg.updates)) {
+      for (const u of msg.updates) {
+        if (u.type === 'css' && u.path) {
+          updateCss(u.path);
+        } else if (u.type === 'js' && u.path) {
+          updateJsSelf(u.path, u.timestamp);
+        } else {
+          console.log('[mini-vite] HMR update (ignored)', u);
+        }
+      }
+    }
+  } catch (err) {
+    console.warn('[mini-vite] HMR invalid message', e.data);
+  }
+});
+
+// 暴露 debug 入口
+window.__mini_vite_hmr = { ws, hotModules, createHotContext };
+
+
+### mini-vite/core/graph.js
+
 import { posix } from 'path';
 
 export function scanImports(code) {
@@ -564,10 +648,23 @@ export class ModuleGraph {
       }))
     };
   }
+
+  collectAffected(url) {
+    const res = new Set();
+    const visit = u => {
+      if (res.has(u)) return;
+      res.add(u);
+      const node = this.nodes.get(u);
+      if (!node) return;
+      for (const p of node.importers) visit(p);
+    };
+    visit(url);
+    return Array.from(res);
+  }
 }
 
+### mini-vite/core/rewriter.js
 
-mini-vite/core/rewriter.js
 import path, { posix } from 'path';
 
 export function isBareImport(spec) {
@@ -627,7 +724,8 @@ return (
 );
 }
 
-mini-vite/core/resolver.js
+### mini-vite/core/resolver.js
+
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -689,7 +787,8 @@ const normalized = path.normalize(urlPath).replace(/^(\.\.(\/|\\|$))+/g, '');
 return path.join(root, normalized);
 }
 
-mini-vite/core/static.js
+### mini-vite/core/static.js
+
 export function getContentType(filePath) {
 if (filePath.endsWith('.html')) return 'text/html; charset=utf-8';
 if (filePath.endsWith('.js')) return 'application/javascript; charset=utf-8';
@@ -699,7 +798,7 @@ if (filePath.endsWith('.svg')) return 'image/svg+xml';
 return 'text/plain; charset=utf-8';
 }
 
-mini-vite/index.html
+### mini-vite/index.html
 
 <!doctype html>
 <html>
@@ -718,7 +817,8 @@ mini-vite/index.html
   </body>
 </html>
 
-mini-vite/src/main.js
+### mini-vite/src/main.js
+
 import './style.css';
 import data from './data.json';
 
@@ -732,12 +832,14 @@ document.querySelector('#app').innerHTML = `
 // import { shuffle } from 'lodash-es';
 // console.log('shuffle test', shuffle([1,2,3,4]));
 
-mini-vite/src/style.css
+### mini-vite/src/style.css
+
 body { font-family: system-ui, sans-serif; }
 h1 { margin: 16px 0; }
 #app { padding: 12px; border: 1px dashed #888; }
 
-mini-vite/src/data.json
+### mini-vite/src/data.json
+
 { "hello": "world" }
 
 已完成能力（Day 1–10）
@@ -753,10 +855,9 @@ HMR 通道（WebSocket 原生握手與訊息推送）
 建立 Module Graph（url → deps[] / importers[]）
 每次傳送 JS 模組時記錄其依賴關係
 提供 /__graph.json 端點檢視當前模組圖
+import.meta.hot.accept() 最小實作
 
-後續天數規劃（Day 11–30）
-
-Day 11：JS HMR 基礎 — import.meta.hot.accept() 最小實作；WS update 訊息帶上受影響模組。
+後續天數規劃（Day 12–30）
 
 Day 12：錯誤覆蓋層 & 快取控制 — 顯示 runtime 錯誤 overlay；簡單 ETag 或時間戳避免快取干擾。
 
