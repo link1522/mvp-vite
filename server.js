@@ -223,6 +223,27 @@ watchDirRecursive(SRC_DIR);
 
 fs.watch(__dirname);
 
+function createEtagFromStat(st) {
+  if (!st) return null;
+  const mtime = Math.floor(st.mtimeMs || (st.mtime ? st.mtime.getTime() : 0));
+  return `W/"${st.size}-${mtime}"`;
+}
+
+function setCacheHeaders(res, stat) {
+  const etag = createEtagFromStat(stat);
+  if (etag) res.setHeader('Etag', etag);
+  if (stat && stat.mtime)
+    res.setHeader('Last-Modified', stat.mtime.toUTCString());
+  res.setHeader('Cache-Control', 'no-cache');
+  return etag;
+}
+
+function isFreshByEtag(req, etag) {
+  const inm = req.headers['if-none-match'];
+  if (inm && etag && inm === etag) return true;
+  return false;
+}
+
 // server 主程式
 const server = http.createServer((req, res) => {
   const rawUrl = decodeURIComponent(req.url || '/');
@@ -232,7 +253,7 @@ const server = http.createServer((req, res) => {
   if (urlPath === '/__graph.json') {
     res.writeHead(200, {
       'content-type': 'application/json; charset=utf-8',
-      'cache-control': 'no-store'
+      'cache-control': 'no-cache'
     });
     res.end(JSON.stringify(moduleGraph.toJSON(), null, 2));
     return;
@@ -255,7 +276,7 @@ const server = http.createServer((req, res) => {
   if (urlPath === '/livereload.js') {
     res.writeHead(200, {
       'content-type': 'application/javascript; charset=utf-8',
-      'cache-control': 'no-store'
+      'cache-control': 'no-cache'
     });
     res.end(livereloadClientJs);
     return;
@@ -272,6 +293,14 @@ const server = http.createServer((req, res) => {
         baseFromSub = dir === '/' ? '' : dir;
       }
       const urlBase = `/@modules/${moduleName}${baseFromSub}`;
+
+      const st = fs.statSync(absPath);
+      const etag = setCacheHeaders(res, st);
+      if (isFreshByEtag(req, etag)) {
+        res.writeHead(304);
+        res.end();
+        return;
+      }
 
       const code = fs.readFileSync(absPath, 'utf-8');
       const transformed = rewriteImports(code, {
@@ -299,62 +328,72 @@ const server = http.createServer((req, res) => {
     urlPath === '/' ? '/index.html' : urlPath
   );
 
-  fs.readFile(filePath, (err, data) => {
-    if (err) {
-      const isNotFound = err.code === 'ENOENT';
-      const status = isNotFound ? 404 : 500;
-      const message = isNotFound ? 'Not Found' : `Server error: ${err.message}`;
-      res.writeHead(status, {
-        'content-type': 'text/plain; charset=utf-8'
-      });
-      res.end(message);
-      return;
-    }
+  fs.stat(filePath, (statErr, st) => {
+    const hasStat = !statErr && st && st.isFile();
 
-    const lower = filePath.toLowerCase();
-
-    if (lower.endsWith('.json')) {
-      res.writeHead(200, {
-        'content-type': 'application/javascript; charset=utf-8',
-        'cache-control': 'no-store'
-      });
-      res.end(wrapJsonAsJs(data.toString('utf-8')));
-      return;
-    }
-
-    if (lower.endsWith('.css')) {
-      const isRaw = u.searchParams.has('raw');
-      if (isRaw) {
-        res.writeHead(200, {
-          'content-type': 'text/css; charset=utf-8',
-          'cache-control': 'no-store'
+    fs.readFile(filePath, (err, data) => {
+      if (err) {
+        const isNotFound = err.code === 'ENOENT';
+        const status = isNotFound ? 404 : 500;
+        const message = isNotFound
+          ? 'Not Found'
+          : `Server error: ${err.message}`;
+        res.writeHead(status, {
+          'content-type': 'text/plain; charset=utf-8',
+          'cache-control': 'no-cache'
         });
-        res.end(data.toString('utf-8'));
+        res.end(message);
         return;
       }
+
+      const etag = setCacheHeaders(res, hasStat ? st : null);
+      if (isFreshByEtag(req, etag)) {
+        res.writeHead(304);
+        res.end();
+        return;
+      }
+
+      const lower = filePath.toLowerCase();
+
+      if (lower.endsWith('.json')) {
+        res.writeHead(200, {
+          'content-type': 'application/javascript; charset=utf-8'
+        });
+        res.end(wrapJsonAsJs(data.toString('utf-8')));
+        return;
+      }
+
+      if (lower.endsWith('.css')) {
+        const isRaw = u.searchParams.has('raw');
+        if (isRaw) {
+          res.writeHead(200, {
+            'content-type': 'text/css; charset=utf-8'
+          });
+          res.end(data.toString('utf-8'));
+          return;
+        }
+        res.writeHead(200, {
+          'content-type': 'application/javascript; charset=utf-8'
+        });
+        res.end(wrapCssAsJs(data.toString('utf-8'), urlPath));
+        return;
+      }
+
+      const ct = getContentType(filePath);
+
       res.writeHead(200, {
-        'content-type': 'application/javascript; charset=utf-8',
-        'cache-control': 'no-store'
+        'Content-Type': ct
       });
-      res.end(wrapCssAsJs(data.toString('utf-8'), urlPath));
-      return;
-    }
 
-    const ct = getContentType(filePath);
-
-    res.writeHead(200, {
-      'Content-Type': ct,
-      'cache-control': 'no-store'
+      if (ct === 'application/javascript; charset=utf-8') {
+        const transformed = rewriteImports(data.toString('utf-8'));
+        const withHmr = injectImportMetaHot(transformed, urlPath);
+        moduleGraph.recordFromCode(urlPath, withHmr);
+        res.end(withHmr);
+      } else {
+        res.end(data);
+      }
     });
-
-    if (ct === 'application/javascript; charset=utf-8') {
-      const transformed = rewriteImports(data.toString('utf-8'));
-      const withHmr = injectImportMetaHot(transformed, urlPath);
-      moduleGraph.recordFromCode(urlPath, withHmr);
-      res.end(withHmr);
-    } else {
-      res.end(data);
-    }
   });
 });
 
@@ -385,7 +424,6 @@ server.on('upgrade', (req, socket) => {
   socket.on('end', () => wsClients.delete(socket));
   socket.on('error', () => wsClients.delete(socket));
 
-  // 目前不處理 client->server 訊息；忽略資料（可在 Day 11 擴充）
   socket.on('data', () => {});
 });
 
