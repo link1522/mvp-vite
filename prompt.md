@@ -4,7 +4,7 @@
 有修改的部分要用註解標示，例如:
 // ===================== 修改開始 ======================
 // ===================== 修改結束 ======================
-我會用「開始 Day X」來指定天數；若我沒指定，預設從 Day 12 開始。
+我會用「開始 Day X」來指定天數；若我沒指定，預設從 Day 13 開始。
 
 專案狀態（請記住）
 
@@ -27,6 +27,7 @@ package.json（已設為 ESM）：
 mini-vite/
 ├─ package.json
 ├─ server.js
+├─ error-overlay.js
 ├─ hmr.js
 ├─ core/
 │ ├─ graph.js
@@ -270,6 +271,27 @@ watchDirRecursive(SRC_DIR);
 
 fs.watch(__dirname);
 
+function createEtagFromStat(st) {
+  if (!st) return null;
+  const mtime = Math.floor(st.mtimeMs || (st.mtime ? st.mtime.getTime() : 0));
+  return `W/"${st.size}-${mtime}"`;
+}
+
+function setCacheHeaders(res, stat) {
+  const etag = createEtagFromStat(stat);
+  if (etag) res.setHeader('Etag', etag);
+  if (stat && stat.mtime)
+    res.setHeader('Last-Modified', stat.mtime.toUTCString());
+  res.setHeader('Cache-Control', 'no-cache');
+  return etag;
+}
+
+function isFreshByEtag(req, etag) {
+  const inm = req.headers['if-none-match'];
+  if (inm && etag && inm === etag) return true;
+  return false;
+}
+
 // server 主程式
 const server = http.createServer((req, res) => {
   const rawUrl = decodeURIComponent(req.url || '/');
@@ -279,7 +301,7 @@ const server = http.createServer((req, res) => {
   if (urlPath === '/__graph.json') {
     res.writeHead(200, {
       'content-type': 'application/json; charset=utf-8',
-      'cache-control': 'no-store'
+      'cache-control': 'no-cache'
     });
     res.end(JSON.stringify(moduleGraph.toJSON(), null, 2));
     return;
@@ -302,7 +324,7 @@ const server = http.createServer((req, res) => {
   if (urlPath === '/livereload.js') {
     res.writeHead(200, {
       'content-type': 'application/javascript; charset=utf-8',
-      'cache-control': 'no-store'
+      'cache-control': 'no-cache'
     });
     res.end(livereloadClientJs);
     return;
@@ -319,6 +341,14 @@ const server = http.createServer((req, res) => {
         baseFromSub = dir === '/' ? '' : dir;
       }
       const urlBase = `/@modules/${moduleName}${baseFromSub}`;
+
+      const st = fs.statSync(absPath);
+      const etag = setCacheHeaders(res, st);
+      if (isFreshByEtag(req, etag)) {
+        res.writeHead(304);
+        res.end();
+        return;
+      }
 
       const code = fs.readFileSync(absPath, 'utf-8');
       const transformed = rewriteImports(code, {
@@ -346,62 +376,72 @@ const server = http.createServer((req, res) => {
     urlPath === '/' ? '/index.html' : urlPath
   );
 
-  fs.readFile(filePath, (err, data) => {
-    if (err) {
-      const isNotFound = err.code === 'ENOENT';
-      const status = isNotFound ? 404 : 500;
-      const message = isNotFound ? 'Not Found' : `Server error: ${err.message}`;
-      res.writeHead(status, {
-        'content-type': 'text/plain; charset=utf-8'
-      });
-      res.end(message);
-      return;
-    }
+  fs.stat(filePath, (statErr, st) => {
+    const hasStat = !statErr && st && st.isFile();
 
-    const lower = filePath.toLowerCase();
-
-    if (lower.endsWith('.json')) {
-      res.writeHead(200, {
-        'content-type': 'application/javascript; charset=utf-8',
-        'cache-control': 'no-store'
-      });
-      res.end(wrapJsonAsJs(data.toString('utf-8')));
-      return;
-    }
-
-    if (lower.endsWith('.css')) {
-      const isRaw = u.searchParams.has('raw');
-      if (isRaw) {
-        res.writeHead(200, {
-          'content-type': 'text/css; charset=utf-8',
-          'cache-control': 'no-store'
+    fs.readFile(filePath, (err, data) => {
+      if (err) {
+        const isNotFound = err.code === 'ENOENT';
+        const status = isNotFound ? 404 : 500;
+        const message = isNotFound
+          ? 'Not Found'
+          : `Server error: ${err.message}`;
+        res.writeHead(status, {
+          'content-type': 'text/plain; charset=utf-8',
+          'cache-control': 'no-cache'
         });
-        res.end(data.toString('utf-8'));
+        res.end(message);
         return;
       }
+
+      const etag = setCacheHeaders(res, hasStat ? st : null);
+      if (isFreshByEtag(req, etag)) {
+        res.writeHead(304);
+        res.end();
+        return;
+      }
+
+      const lower = filePath.toLowerCase();
+
+      if (lower.endsWith('.json')) {
+        res.writeHead(200, {
+          'content-type': 'application/javascript; charset=utf-8'
+        });
+        res.end(wrapJsonAsJs(data.toString('utf-8')));
+        return;
+      }
+
+      if (lower.endsWith('.css')) {
+        const isRaw = u.searchParams.has('raw');
+        if (isRaw) {
+          res.writeHead(200, {
+            'content-type': 'text/css; charset=utf-8'
+          });
+          res.end(data.toString('utf-8'));
+          return;
+        }
+        res.writeHead(200, {
+          'content-type': 'application/javascript; charset=utf-8'
+        });
+        res.end(wrapCssAsJs(data.toString('utf-8'), urlPath));
+        return;
+      }
+
+      const ct = getContentType(filePath);
+
       res.writeHead(200, {
-        'content-type': 'application/javascript; charset=utf-8',
-        'cache-control': 'no-store'
+        'Content-Type': ct
       });
-      res.end(wrapCssAsJs(data.toString('utf-8'), urlPath));
-      return;
-    }
 
-    const ct = getContentType(filePath);
-
-    res.writeHead(200, {
-      'Content-Type': ct,
-      'cache-control': 'no-store'
+      if (ct === 'application/javascript; charset=utf-8') {
+        const transformed = rewriteImports(data.toString('utf-8'));
+        const withHmr = injectImportMetaHot(transformed, urlPath);
+        moduleGraph.recordFromCode(urlPath, withHmr);
+        res.end(withHmr);
+      } else {
+        res.end(data);
+      }
     });
-
-    if (ct === 'application/javascript; charset=utf-8') {
-      const transformed = rewriteImports(data.toString('utf-8'));
-      const withHmr = injectImportMetaHot(transformed, urlPath);
-      moduleGraph.recordFromCode(urlPath, withHmr);
-      res.end(withHmr);
-    } else {
-      res.end(data);
-    }
   });
 });
 
@@ -800,20 +840,17 @@ return 'text/plain; charset=utf-8';
 
 ### mini-vite/index.html
 
-<!doctype html>
+<!DOCTYPE html>
 <html>
   <head>
-    <meta charset="utf-8" />
-    <title>mini-vite</title>
+    <title>Mini Vite</title>
   </head>
   <body>
-    <h1>Mini Vite Dev</h1>
+    <h1>Hello Mini Vite</h1>
     <div id="app"></div>
-
-    <script type="module" src="/livereload.js"></script>
-    <script type="module" src="/hmr.js"></script>
+    <script type="module" src="/error-overlay.js"></script>
     <script type="module" src="/src/main.js"></script>
-
+    <script type="module" src="/livereload.js"></script>
   </body>
 </html>
 
@@ -842,6 +879,98 @@ h1 { margin: 16px 0; }
 
 { "hello": "world" }
 
+### error-overlay.js
+
+const ID = '__mini_vite_error_overlay';
+
+function ensureOverlay() {
+  let el = document.getElementById(ID);
+  if (el) return el;
+  el = document.createElement('div');
+  el.id = ID;
+  el.style.position = 'fixed';
+  el.style.inset = '0';
+  el.style.background = 'rgba(0,0,0,0.66)';
+  el.style.color = '#fff';
+  el.style.fontFamily =
+    'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace';
+  el.style.zIndex = '2147483647';
+  el.style.display = 'none';
+  el.style.overflow = 'auto';
+
+  const inner = document.createElement('div');
+  inner.style.maxWidth = '960px';
+  inner.style.margin = '40px auto';
+  inner.style.padding = '16px 20px';
+  inner.style.background = '#111';
+  inner.style.border = '1px solid #444';
+  inner.style.borderRadius = '8px';
+  inner.innerHTML = `
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+      <h2 style="margin:0;font-size:20px;">⚠️ Runtime Error</h2>
+      <button id="__mv_close" style="font-size:14px;background:#333;color:#fff;border:1px solid #555;border-radius:6px;padding:6px 10px;cursor:pointer;">Dismiss</button>
+    </div>
+    <pre id="__mv_msg" style="white-space:pre-wrap;line-height:1.4;font-size:13px;"></pre>
+  `;
+
+  el.appendChild(inner);
+  document.body.appendChild(el);
+
+  inner.querySelector('#__mv_close').addEventListener('click', () => {
+    el.style.display = 'none';
+  });
+
+  return el;
+}
+
+function formatError(errLike) {
+  if (!errLike) return 'Unknown error';
+  if (typeof errLike === 'string') return errLike;
+  const name = errLike.name || 'Error';
+  const msg = errLike.message || String(errLike);
+  const stack = errLike.stack || '';
+  return `${name}: ${msg}\n\n${stack}`;
+}
+
+function showErrorOverlay(err) {
+  const el = ensureOverlay();
+  const msgEl = el.querySelector('#__mv_msg');
+  msgEl.textContent = formatError(err);
+  el.style.display = 'block';
+}
+
+function clearOverlay() {
+  const el = document.getElementById(ID);
+  if (el) el.style.display = 'none';
+}
+
+window.addEventListener('error', e => {
+  showErrorOverlay(
+    e.error || {
+      name: 'Error',
+      message: e.message,
+      stack: e?.error?.stack || ''
+    }
+  );
+});
+
+window.addEventListener('unhandledrejection', e => {
+  const reason =
+    e.reason instanceof Error ? e.reason : new Error(String(e.reason));
+  showErrorOverlay(reason);
+});
+
+if (window.__mini_vite_hmr?.ws) {
+  window.__mini_vite_hmr.ws.addEventListener('message', e => {
+    try {
+      const msg = JSON.parse(e.data);
+      if (msg?.type === 'full-reload') clearOverlay();
+    } catch {}
+  });
+}
+
+export { showErrorOverlay, clearOverlay };
+
 已完成能力（Day 1–10）
 
 靜態資源服務（含 JSON/CSS → ESM 包裝）
@@ -856,10 +985,9 @@ HMR 通道（WebSocket 原生握手與訊息推送）
 每次傳送 JS 模組時記錄其依賴關係
 提供 /__graph.json 端點檢視當前模組圖
 import.meta.hot.accept() 最小實作
+錯誤覆蓋層 & 快取控制 — 顯示 runtime 錯誤 overlay；簡單 ETag 或時間戳避免快取干擾。
 
-後續天數規劃（Day 12–30）
-
-Day 12：錯誤覆蓋層 & 快取控制 — 顯示 runtime 錯誤 overlay；簡單 ETag 或時間戳避免快取干擾。
+後續天數規劃（Day 13–30）
 
 Day 13：依賴預編譯（概念版） — 把常用依賴預打包到 /deps/\*，回應時優先改寫，並加強快取標頭。
 
